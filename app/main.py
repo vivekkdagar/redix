@@ -88,6 +88,8 @@ def parse_resp_message(conn):
 # ==============================
 # Basic RDB Loader (for KEYS *)
 # ==============================
+import string
+
 def load_rdb_file(dir_path, filename):
     path = os.path.join(dir_path, filename)
     if not os.path.exists(path):
@@ -97,27 +99,27 @@ def load_rdb_file(dir_path, filename):
     try:
         with open(path, "rb") as f:
             data = f.read()
-        # RDB files start with "REDIS" signature
         if not data.startswith(b"REDIS"):
             print("Invalid RDB file signature.")
             return
-        # Extremely simplified parser: just detect key names in ASCII
-        # (Not full RDB decode, enough for KEYS * in early stages)
-        # We'll look for printable strings between known markers.
+
         keys_found = []
         i = 0
         while i < len(data):
             if data[i] == 0x00:  # type: string key
-                # next is length-prefixed key
+                if i + 2 >= len(data): break
                 keylen = data[i + 1]
-                key = data[i + 2 : i + 2 + keylen].decode(errors="ignore")
-                keys_found.append(key)
+                raw_key = data[i + 2 : i + 2 + keylen]
+                # Keep only printable characters
+                key = "".join(ch for ch in raw_key.decode(errors="ignore") if ch in string.printable).strip()
+                if key:
+                    keys_found.append(key)
+                    data_store[key] = "(rdb_loaded_value)"
                 i += 2 + keylen
             else:
                 i += 1
-        for k in keys_found:
-            data_store[k] = "(rdb_loaded_value)"
-        print(f"Loaded keys from RDB: {keys_found}")
+
+        print(f"Safely loaded keys from RDB: {keys_found}")
     except Exception as e:
         print(f"Error reading RDB file: {e}")
 
