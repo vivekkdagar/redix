@@ -2,6 +2,8 @@ import socket
 import threading
 import time
 import sys
+import os
+import struct
 from collections import defaultdict
 
 # ==============================
@@ -11,9 +13,9 @@ data_store = {}
 expiry_store = {}
 blocking_conditions = defaultdict(threading.Condition)
 
-# Default config values (overridden via CLI args)
+# Default config (can be overridden via CLI args)
 config = {
-    "dir": "/tmp",
+    "dir": ".",
     "dbfilename": "dump.rdb"
 }
 
@@ -82,6 +84,42 @@ def parse_resp_message(conn):
         conn.recv(2)  # consume \r\n
         args.append(arg.decode())
     return args
+
+# ==============================
+# Basic RDB Loader (for KEYS *)
+# ==============================
+def load_rdb_file(dir_path, filename):
+    path = os.path.join(dir_path, filename)
+    if not os.path.exists(path):
+        print(f"No RDB file found at {path}. Starting with empty DB.")
+        return
+
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        # RDB files start with "REDIS" signature
+        if not data.startswith(b"REDIS"):
+            print("Invalid RDB file signature.")
+            return
+        # Extremely simplified parser: just detect key names in ASCII
+        # (Not full RDB decode, enough for KEYS * in early stages)
+        # We'll look for printable strings between known markers.
+        keys_found = []
+        i = 0
+        while i < len(data):
+            if data[i] == 0x00:  # type: string key
+                # next is length-prefixed key
+                keylen = data[i + 1]
+                key = data[i + 2 : i + 2 + keylen].decode(errors="ignore")
+                keys_found.append(key)
+                i += 2 + keylen
+            else:
+                i += 1
+        for k in keys_found:
+            data_store[k] = "(rdb_loaded_value)"
+        print(f"Loaded keys from RDB: {keys_found}")
+    except Exception as e:
+        print(f"Error reading RDB file: {e}")
 
 # ==============================
 # Commands
@@ -181,6 +219,11 @@ def handle_config_get(args):
     else:
         return encode_array([])
 
+def handle_keys(args):
+    if len(args) < 2 or args[1] != "*":
+        return encode_array([])
+    return encode_array(list(data_store.keys()))
+
 # ==============================
 # Dispatcher
 # ==============================
@@ -196,7 +239,9 @@ def execute_command(args):
     if cmd == "LLEN": return handle_llen(args)
     if cmd == "LPOP": return handle_lpop(args)
     if cmd == "BLPOP": return handle_blpop(args)
-    if cmd == "CONFIG" and len(args) > 1 and args[1].upper() == "GET": return handle_config_get(args[1:])
+    if cmd == "CONFIG" and len(args) > 1 and args[1].upper() == "GET":
+        return handle_config_get(args[1:])
+    if cmd == "KEYS": return handle_keys(args)
     return encode_error(f"ERR unknown command '{cmd}'")
 
 # ==============================
@@ -225,6 +270,8 @@ def main():
             config["dir"] = sys.argv[i + 1]
         elif arg == "--dbfilename" and i + 1 < len(sys.argv):
             config["dbfilename"] = sys.argv[i + 1]
+
+    load_rdb_file(config["dir"], config["dbfilename"])
 
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
