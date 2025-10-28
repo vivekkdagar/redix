@@ -1,184 +1,332 @@
-import asyncio
-from datetime import datetime, timedelta
-from enum import Enum
-from dataclasses import dataclass
-from typing import Any, Optional
+import dataclasses
+import socket
+import threading
+import datetime
+import argparse
+from typing import Any, Dict, Optional, cast, List
 
-# ---------------------------
-# ENUM: Supported Commands
-# ---------------------------
-class Command(Enum):
-    ECHO = "ECHO"
-    SET = "SET"
-    GET = "GET"
-    PING = "PING"
-    RPUSH = "RPUSH"
+from app import rdb_parser
 
-
-# ---------------------------
-# Data storage structure
-# ---------------------------
-@dataclass
-class Value:
-    item: Any
-    expire: Optional[datetime] = None
+EMPTY_RDB = bytes.fromhex(
+    "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2"
+)
+transaction_enabled = {}
+transactions = {}
 
 
-class Storage:
-    def __init__(self):
-        self.data: dict[str, Any] = {}
-
-    def set(self, key: str, value: Value) -> None:
-        self.data[key] = value
-
-    def get(self, key: str) -> Optional[Any]:
-        value = self.data.get(key)
-        if isinstance(value, Value):
-            if value.expire and value.expire <= datetime.now():
-                del self.data[key]
-                return None
-            return value.item
-        return value
-
-    def rpush(self, key: str, *values: str) -> int:
-        # If key doesn't exist, create list
-        if key not in self.data:
-            self.data[key] = []
-
-        # If key exists and is not a list, error
-        if not isinstance(self.data[key], list):
-            raise RuntimeError(f"Key {key} exists and is not a list")
-
-        # Append all values
-        self.data[key].extend(values)
-        return len(self.data[key])
+@dataclasses.dataclass
+class Args:
+    port: int
+    replicaof: Optional[str]
 
 
-storage = Storage()
+def parse_next(data: bytes):
+    first, data = data.split(b"\r\n", 1)
+    match first[:1]:
+        case b"*":
+            value = []
+            l = int(first[1:].decode())
+            for _ in range(l):
+                item, data = parse_next(data)
+                value.append(item)
+            return value, data
+        case b"$":
+            l = int(first[1:].decode())
+            blk = data[:l]
+            data = data[l + 2 :]
+            return blk, data
+
+        case b"+":
+            return first[1:].decode(), data
+
+        case _:
+            raise RuntimeError(f"Parse not implemented: {first[:1]}")
 
 
-# ---------------------------
-# RESP Formatter helpers
-# ---------------------------
-class Formatter:
-    @staticmethod
-    def format_simple_string(s: str) -> bytes:
-        return f"+{s}\r\n".encode()
+def encode_resp(
+    data: Any, trailing_crlf: bool = True, encoded_list: bool = False
+) -> bytes:
+    if isinstance(data, bytes):
+        return b"$%b\r\n%b%b" % (
+            str(len(data)).encode(),
+            data,
+            b"\r\n" if trailing_crlf else b"",
+        )
+    if isinstance(data, str):
+        if data[0] == "-":
+            return b"%b\r\n" % (data.encode(),)
+        return b"+%b\r\n" % (data.encode(),)
+    if isinstance(data, int):
+        return b":%b\r\n" % (str(data).encode())
+    if data is None:
+        return b"$-1\r\n"
+    if isinstance(data, list):
+        return b"*%b\r\n%b" % (
+            str(len(data)).encode(),
+            b"".join(map(encode_resp, data)),
+        )
 
-    @staticmethod
-    def format_bulk_string(s: Optional[str]) -> bytes:
-        if s is None:
-            return b"$-1\r\n"
-        return f"${len(s)}\r\n{s}\r\n".encode()
-
-    @staticmethod
-    def format_integer(n: int) -> bytes:
-        return f":{n}\r\n".encode()
-
-
-formatter = Formatter()
-
-
-# ---------------------------
-# RESP Parser
-# ---------------------------
-class Parser:
-    def parse_command(self, payload: bytes) -> tuple[Command, list[str]]:
-        message = payload.decode()
-        elements = message.split("\r\n")
-        if not elements or not elements[0].startswith("*"):
-            raise Exception("Invalid RESP array format")
-
-        # Parse RESP array
-        result = []
-        i = 2  # skip "*<n>" and "$<len>"
-        while i < len(elements):
-            if elements[i] == "":
-                break
-            result.append(elements[i])
-            i += 2  # skip $len entries
-
-        cmd_str = result[0].upper()
-        try:
-            cmd = Command(cmd_str)
-        except ValueError:
-            raise RuntimeError(f"Unknown command: {cmd_str}")
-
-        return cmd, result
+    raise RuntimeError(f"Encode not implemented: {data}")
 
 
-parser = Parser()
+db: Dict[Any, rdb_parser.Value] = {}
 
 
-# ---------------------------
-# Command Processor
-# ---------------------------
-async def process_command(cmd: tuple[Command, list[str]], writer: Any) -> None:
-    command, args = cmd
-
-    if command == Command.PING:
-        writer.write(formatter.format_simple_string("PONG"))
-
-    elif command == Command.ECHO:
-        # ECHO <message>
-        writer.write(formatter.format_bulk_string(args[1]))
-
-    elif command == Command.SET:
-        # SET <key> <value> [EX seconds | PX milliseconds]
-        key = args[1]
-        value = args[2]
-        expiration = None
-
-        if len(args) > 3:
-            if args[3].upper() == "EX":
-                expiration = datetime.now() + timedelta(seconds=int(args[4]))
-            elif args[3].upper() == "PX":
-                expiration = datetime.now() + timedelta(milliseconds=int(args[4]))
-
-        storage.set(key, Value(value, expiration))
-        writer.write(formatter.format_simple_string("OK"))
-
-    elif command == Command.GET:
-        # GET <key>
-        key = args[1]
-        val = storage.get(key)
-        writer.write(formatter.format_bulk_string(val))
-
-    elif command == Command.RPUSH:
-        # RPUSH <key> <value1> [value2 ...]
-        key = args[1]
-        values = args[2:]
-        length = storage.rpush(key, *values)
-        writer.write(formatter.format_integer(length))
-
-    await writer.drain()
+@dataclasses.dataclass
+class Replication:
+    master_replid: str
+    master_repl_offset: int
+    connected_replicas: List[socket.socket]
 
 
-# ---------------------------
-# TCP Server
-# ---------------------------
-async def handle_client(reader, writer):
-    try:
+replication = Replication(
+    master_replid="8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb",
+    master_repl_offset=0,
+    connected_replicas=[],
+)
+
+
+def handle_conn(args: Args, conn: socket.socket, is_replica_conn: bool = False):
+    data = b""
+    global transaction_enabled, transactions
+
+    while data or (data := conn.recv(4096)):
+        value, data = parse_next(data)
+        trailing_crlf = True
+
+        if conn not in transaction_enabled.keys():
+            transaction_enabled[conn] = False
+            transactions[conn] = []
+
+        response = handle_command(value, conn, is_replica_conn, trailing_crlf)
+
+        if not transaction_enabled[conn]:
+            encoded_resp = encode_resp(response, trailing_crlf)
+            conn.send(encoded_resp)
+
+
+def handle_command(
+    value: List,
+    conn: socket.socket,
+    is_replica_conn: bool = False,
+    trailing_crlf: bool = True,
+) -> str | None | List[Any]:
+    global transaction_enabled, transactions
+    response = b""
+    match value:
+        case [b"PING"]:
+            response = "PONG"
+        case [b"ECHO", s]:
+            response = s
+        case [b"GET", k]:
+            if not queue_transaction(value, conn):
+                now = datetime.datetime.now()
+                value = db.get(k)
+                if value is None:
+                    response = None
+                elif value.expiry is not None and now >= value.expiry:
+                    db.pop(k)
+                    response = None
+                else:
+                    response = value.value
+        case [b"INFO", b"replication"]:
+            if args.replicaof is None:
+                info = f"""\
+role:master
+master_replid:{replication.master_replid}
+master_repl_offset:{replication.master_repl_offset}
+""".encode()
+            else:
+                info = b"""role:slave\n"""
+            response = info
+        case [b"REPLCONF", b"listening-port", port]:
+            response = "OK"
+        case [b"REPLCONF", b"capa", b"psync2"]:
+            response = "OK"
+        case [b"REPLCONF", b"GETACK", b"*"]:
+            response = ["REPLCONF", "ACK", "0"]
+        case [b"PSYNC", replid, offset]:
+            response = (
+                f"FULLRESYNC "
+                f"{replication.master_replid} "
+                f"{replication.master_repl_offset}"
+            )
+
+            response = EMPTY_RDB
+            trailing_crlf = False
+            # response = ["REPLCONF", "GETACK", "*"])
+            replication.connected_replicas.append(conn)
+            # print('sent')
+        case [b"REPLCONF", b"GETACK", b"*"]:
+            response = ["REPLCONF", "ACK", "0"]
+        case [b"DISCARD"]:
+            if transaction_enabled[conn]:
+                transaction_enabled[conn] = False
+                transactions[conn] = []
+                response = "OK"
+            else:
+                response = "-ERR DISCARD without MULTI"
+        case [b"MULTI"]:
+            transaction_enabled[conn] = True
+            conn.send(encode_resp("OK"))
+        case [b"EXEC"]:
+            if not transaction_enabled[conn]:
+                response = "-ERR EXEC without MULTI"
+            else:
+                transaction_enabled[conn] = False
+                if len(transactions[conn]) == 0:
+                    return []
+                response = handle_transaction(conn, is_replica_conn)
+                transactions[conn] = []
+
+        case [b"RPUSH", k, *v]:
+            if not queue_transaction(value, conn):
+                for rep in replication.connected_replicas:
+                    rep.send(encode_resp(value))
+                if k in db.keys():
+                    db[k].value.extend(v)
+                else:
+                    db[k] = rdb_parser.Value(value=v, expiry=None)
+                if not is_replica_conn:
+                    response = len(db[k].value)
+        case [b"LRANGE", k, s, e]:
+            if k in db.keys():
+                response = db[k].value[int(s) : int(e) + 1]
+            else:
+                response = []
+        case [b"INCR", k]:
+            if not queue_transaction(value, conn):
+                db_value = db.get(k)
+                if db_value is None:
+                    new_value = 1
+                else:
+                    try:
+                        current_int = int(db_value.value.decode())
+                        new_value = current_int + 1
+                    except Exception:
+                        response = "-ERR value is not an integer or out of range"
+                        return response
+
+                db[k] = rdb_parser.Value(
+                    value=str(new_value).encode(),
+                    expiry=None,
+                )
+
+                response = new_value
+        case [b"SET", k, v, b"px", expiry_ms]:
+            if not queue_transaction(value, conn):
+                for rep in replication.connected_replicas:
+                    rep.send(encode_resp(value))
+                now = datetime.datetime.now()
+                expiry_ms = datetime.timedelta(
+                    milliseconds=int(expiry_ms.decode()),
+                )
+                db[k] = rdb_parser.Value(
+                    value=v,
+                    expiry=now + expiry_ms,
+                )
+                if not is_replica_conn:
+                    response = "OK"
+        case [b"SET", k, v]:
+            if not queue_transaction(value, conn):
+                for rep in replication.connected_replicas:
+                    rep.send(encode_resp(value))
+                db[k] = rdb_parser.Value(
+                    value=v,
+                    expiry=None,
+                )
+                if not is_replica_conn:
+                    response = "OK"
+        case _:
+            raise RuntimeError(f"Command not implemented: {value}")
+
+    return response
+
+
+def queue_transaction(command: List, conn: socket.socket):
+    global transaction_enabled, transactions
+    if conn in transaction_enabled.keys() and transaction_enabled[conn] == True:
+        transactions[conn].append(command)
+        conn.send(encode_resp("QUEUED"))
+        return True
+    return False
+
+
+def handle_transaction(conn: socket.socket, is_replica_conn: bool):
+    global transactions
+    response = []
+    for transaction in transactions[conn]:
+        response.append(handle_command(transaction, conn, is_replica_conn))
+    print(response)
+    return response
+
+
+def main(args: Args):
+    global db
+    db = rdb_parser.read_file_and_construct_kvm(args.dir, args.dbfilename)
+    server_socket = socket.create_server(
+        ("localhost", args.port),
+        reuse_port=True,
+    )
+    if args.replicaof is not None:
+        (host, port) = args.replicaof.split(" ")
+        port = int(port)
+        master_conn = socket.create_connection((host, port))
+
+        # Handshake PING
+        master_conn.send(encode_resp([b"PING"]))
+        resp, _ = parse_next(master_conn.recv(4096))
+        assert resp == "PONG"
+        # Handshake REPLCONF listening-port
+        master_conn.send(
+            encode_resp(
+                [
+                    b"REPLCONF",
+                    b"listening-port",
+                    str(args.port).encode(),
+                ]
+            )
+        )
+        resp, _ = parse_next(master_conn.recv(4096))
+        assert resp == "OK"
+        # Handshake REPLCONF capabilities
+        master_conn.send(encode_resp([b"REPLCONF", b"capa", b"psync2"]))
+        resp, _ = parse_next(master_conn.recv(4096))
+        assert resp == "OK"
+
+        # Handshake PSYNC
+        master_conn.send(encode_resp([b"PSYNC", b"?", b"-1"]))
+        resp, _ = parse_next(master_conn.recv(4096))
+        assert isinstance(resp, str)
+        assert resp.startswith("FULLRESYNC")
+        # Receive db
+        resp, _ = parse_next(master_conn.recv(4096))
+
+        print(f"Handshake with master completed: {resp=}")
+
+        threading.Thread(
+            target=handle_conn,
+            args=(args, master_conn, True),
+            daemon=True,
+        ).start()
+    with server_socket:
         while True:
-            data = await reader.read(1024)
-            if not data:
-                break
-
-            cmd = parser.parse_command(data)
-            await process_command(cmd, writer)
-    except Exception as e:
-        print(f"Error: {e}")
-    finally:
-        writer.close()
-        await writer.wait_closed()
-
-
-async def main():
-    print("Redis clone running on port 6379...")
-    server = await asyncio.start_server(handle_client, "localhost", 6379)
-    async with server:
-        await server.serve_forever()
+            (conn, _) = server_socket.accept()
+            threading.Thread(
+                target=handle_conn,
+                args=(
+                    args,
+                    conn,
+                    False,
+                ),
+                daemon=True,
+            ).start()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    args = argparse.ArgumentParser()
+    args.add_argument("--port", type=int, default=6379)
+    args.add_argument("--replicaof", required=False)
+    args.add_argument("--dir", default=".")
+    args.add_argument("--dbfilename", default="empty.rdb")
+    main(cast(Args, args.parse_args()))
