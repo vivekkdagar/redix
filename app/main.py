@@ -3,99 +3,9 @@ import sys
 import struct
 import os
 
-# ---------------- CONFIG ----------------
 HOST = "0.0.0.0"
 PORT = 6379
-data = {}  # In-memory store: {key: (value, expiry)}
-
-
-# ---------------- RDB PARSING HELPERS ----------------
-def _read_length_encoding(f):
-    """Read a length-encoded integer from RDB file"""
-    first_byte = f.read(1)
-    if not first_byte:
-        return 0
-
-    first = first_byte[0]
-    encoding_type = (first & 0xC0) >> 6
-
-    if encoding_type == 0:  # 00 - next 6 bits is length
-        return first & 0x3F
-    elif encoding_type == 1:  # 01 - next 14 bits is length
-        next_byte = f.read(1)[0]
-        return ((first & 0x3F) << 8) | next_byte
-    elif encoding_type == 2:  # 10 - next 4 bytes is length
-        return struct.unpack(">I", f.read(4))[0]
-    else:  # 11 - special encoding
-        return first & 0x3F
-
-
-def _read_string(f):
-    """Read a string from RDB file"""
-    length = _read_length_encoding(f)
-    if length == 0:
-        return ""
-    string_bytes = f.read(length)
-    return string_bytes.decode('utf-8', errors='ignore')
-
-
-def read_key_val_from_db(dir_path, dbfilename, data):
-    """Load key-values from RDB (if exists)"""
-    rdb_file_loc = os.path.join(dir_path, dbfilename)
-    if not os.path.isfile(rdb_file_loc):
-        return
-
-    try:
-        with open(rdb_file_loc, "rb") as f:
-            # Read and verify header (REDIS + version)
-            header = f.read(9)
-            if not header.startswith(b"REDIS"):
-                return
-
-            # Read until we find the database selector (0xFE) or key-value pairs
-            while True:
-                opcode = f.read(1)
-                if not opcode:
-                    break
-
-                # 0xFE = Database selector
-                if opcode == b"\xfe":
-                    f.read(1)  # skip db number
-                    continue
-
-                # 0xFB = Resizedb - hash table size info
-                elif opcode == b"\xfb":
-                    _read_length_encoding(f)
-                    _read_length_encoding(f)
-                    continue
-
-                # 0xFD = Expiry time in seconds
-                elif opcode == b"\xfd":
-                    f.read(4)  # Skip 4 bytes for timestamp
-                    opcode = f.read(1)  # Read actual value type
-
-                # 0xFC = Expiry time in milliseconds
-                elif opcode == b"\xfc":
-                    f.read(8)  # Skip 8 bytes for timestamp
-                    opcode = f.read(1)  # Read actual value type
-
-                # 0xFF = End of RDB file
-                elif opcode == b"\xff":
-                    break
-
-                # 0x00 = String encoding - this is a key-value pair
-                elif opcode == b"\x00":
-                    key = _read_string(f)
-                    value = _read_string(f)
-                    if key and value:
-                        data[key] = (value, -1)  # -1 means no expiry
-
-                else:
-                    # Unknown opcode, stop
-                    break
-
-    except Exception as e:
-        print(f"Error reading RDB file: {e}")
+data = {}  # in-memory key-value store
 
 
 # ---------------- RESP HELPERS ----------------
@@ -119,7 +29,6 @@ def encode_array(items):
 
 
 def decode_command(data):
-    """Parse RESP command"""
     lines = data.split(b"\r\n")
     if not lines or not lines[0].startswith(b"*"):
         return []
@@ -134,8 +43,90 @@ def decode_command(data):
     return [p.decode() for p in parts if p]
 
 
+# ---------------- RDB HELPERS ----------------
+def _read_length_encoding(f):
+    """Read a length-encoded integer from RDB file."""
+    first_byte = f.read(1)
+    if not first_byte:
+        return 0
+
+    fb = first_byte[0]
+    type_ = (fb & 0xC0) >> 6
+
+    if type_ == 0:  # 00 = 6-bit length
+        return fb & 0x3F
+    elif type_ == 1:  # 01 = 14-bit length
+        next_byte = f.read(1)[0]
+        return ((fb & 0x3F) << 8) | next_byte
+    elif type_ == 2:  # 10 = 32-bit length
+        return struct.unpack(">I", f.read(4))[0]
+    else:  # 11 = special encoding
+        return fb & 0x3F
+
+
+def _read_string(f):
+    """Read a string (length-prefixed) from RDB file."""
+    length = _read_length_encoding(f)
+    if length == 0:
+        return ""
+    raw = f.read(length)
+    return raw.decode("utf-8", errors="ignore")
+
+
+def read_key_val_from_db(dir_path, dbfilename, data):
+    """Parse RDB and load keys into memory."""
+    rdb_file = os.path.join(dir_path, dbfilename)
+    if not os.path.exists(rdb_file):
+        return
+
+    try:
+        with open(rdb_file, "rb") as f:
+            header = f.read(9)
+            if not header.startswith(b"REDIS"):
+                return
+
+            while True:
+                b = f.read(1)
+                if not b:
+                    break
+
+                # Database selector
+                if b == b"\xFE":
+                    f.read(1)  # skip db number
+                    continue
+
+                # RESIZEDB
+                elif b == b"\xFB":
+                    _read_length_encoding(f)
+                    _read_length_encoding(f)
+                    continue
+
+                # Expiry seconds
+                elif b == b"\xFD":
+                    f.read(4)
+                    b = f.read(1)
+
+                # Expiry ms
+                elif b == b"\xFC":
+                    f.read(8)
+                    b = f.read(1)
+
+                # End of file
+                elif b == b"\xFF":
+                    break
+
+                # String key-value pair
+                if b == b"\x00":
+                    key = _read_string(f)
+                    val = _read_string(f)
+                    if key:
+                        data[key] = (val, -1)
+    except Exception as e:
+        print(f"Error loading RDB: {e}")
+
+
 # ---------------- COMMAND HANDLER ----------------
-def handle_command(cmd):
+def handle_command(cmd, dir_path, db_filename):
     if not cmd:
         return encode_simple("")
 
@@ -168,9 +159,8 @@ def handle_command(cmd):
         pattern = cmd[1]
         if pattern == "*":
             return encode_array(list(data.keys()))
-        else:
-            matched = [k for k in data.keys() if pattern in k]
-            return encode_array(matched)
+        matched = [k for k in data.keys() if pattern in k]
+        return encode_array(matched)
 
     else:
         return encode_simple("")
@@ -181,16 +171,13 @@ if __name__ == "__main__":
     dir_path = "."
     db_filename = "dump.rdb"
 
-    # Parse CLI args
     if "--dir" in sys.argv:
         dir_path = sys.argv[sys.argv.index("--dir") + 1]
     if "--dbfilename" in sys.argv:
         db_filename = sys.argv[sys.argv.index("--dbfilename") + 1]
 
-    # Load data from RDB file
     read_key_val_from_db(dir_path, db_filename, data)
 
-    # Start server
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((HOST, PORT))
@@ -200,9 +187,9 @@ if __name__ == "__main__":
         while True:
             conn, _ = s.accept()
             with conn:
-                data_in = conn.recv(4096)
-                if not data_in:
+                req = conn.recv(4096)
+                if not req:
                     continue
-                cmd = decode_command(data_in)
-                response = handle_command(cmd)
-                conn.sendall(response)
+                cmd = decode_command(req)
+                resp = handle_command(cmd, dir_path, db_filename)
+                conn.sendall(resp)
