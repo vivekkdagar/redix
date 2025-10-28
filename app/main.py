@@ -24,8 +24,6 @@ def encode_array(arr):
         resp += encode_bulk_string(el)
     return resp
 
-def encode_null_array():
-    return "*-1\r\n"
 
 # --- RESP PARSER ---
 def parse_request(data):
@@ -101,6 +99,16 @@ def handle_client(conn):
                 data_store[key].extend(values)
                 conn.sendall(encode_integer(len(data_store[key])).encode())
 
+            elif command == "LPUSH":
+                key = request[1]
+                values = request[2:]
+                if key not in data_store:
+                    data_store[key] = []
+                # prepend (reverse order like Redis)
+                for v in values:
+                    data_store[key].insert(0, v)
+                conn.sendall(encode_integer(len(data_store[key])).encode())
+
             elif command == "LLEN":
                 key = request[1]
                 length = len(data_store.get(key, []))
@@ -119,14 +127,14 @@ def handle_client(conn):
                 key = request[1]
                 lst = data_store.get(key, [])
 
-                if len(request) == 2:  # single element pop
+                if len(request) == 2:  # single pop
                     if not lst:
                         conn.sendall(encode_null_bulk_string().encode())
                     else:
                         val = lst.pop(0)
                         conn.sendall(encode_bulk_string(val).encode())
 
-                elif len(request) == 3:  # multiple elements
+                elif len(request) == 3:  # multiple pop
                     count = int(request[2])
                     if not lst:
                         conn.sendall(encode_array([]).encode())
