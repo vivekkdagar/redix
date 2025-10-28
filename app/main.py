@@ -1,14 +1,94 @@
-import socket
-import threading
-from datetime import datetime, timedelta
+import asyncio
+from enum import Enum
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 
-# -------------------------------
-# Data Classes and Storage Layer
-# -------------------------------
+# ==========================
+# ENUM: Command Types
+# ==========================
+class Command(Enum):
+    ECHO = 1
+    SET = 2
+    GET = 3
+    PING = 4
+    RPUSH = 5
 
+
+# ==========================
+# PARSER
+# ==========================
+class Parser:
+    def parse_command(self, payload: bytes) -> tuple[Command, ...]:
+        message = payload.decode()
+        upper = message.upper()
+
+        if "ECHO" in upper:
+            return Command.ECHO, *self._parse(message)
+        elif "SET" in upper:
+            return Command.SET, *self._parse(message)
+        elif "GET" in upper:
+            return Command.GET, *self._parse(message)
+        elif "PING" in upper:
+            return Command.PING, *("PING",)
+        elif "RPUSH" in upper:
+            return Command.RPUSH, *self._parse(message)
+        else:
+            raise RuntimeError("Unknown command")
+
+    @staticmethod
+    def _parse(message: str) -> list[str]:
+        parts = message.split("\r\n")
+        result = []
+        i = 0
+        while i < len(parts):
+            if parts[i].startswith("$"):
+                i += 1
+                if i < len(parts) and parts[i] != "":
+                    result.append(parts[i])
+            i += 1
+        return result
+
+
+parser = Parser()
+
+
+# ==========================
+# FORMATTER
+# ==========================
+class Formatter:
+    @staticmethod
+    def format_echo_expression(args: tuple[str, ...]) -> bytes:
+        msg = args[1].encode()
+        return b"$" + str(len(msg)).encode() + b"\r\n" + msg + b"\r\n"
+
+    @staticmethod
+    def format_ok_expression() -> bytes:
+        return b"+OK\r\n"
+
+    @staticmethod
+    def format_get_response(value: Any) -> bytes:
+        if value is None:
+            return b"$-1\r\n"
+        if isinstance(value, Value):
+            val = str(value.item).encode()
+        else:
+            val = str(value).encode()
+        return b"$" + str(len(val)).encode() + b"\r\n" + val + b"\r\n"
+
+    @staticmethod
+    def format_rpush_response(values: list) -> bytes:
+        # RESP integer
+        return f":{len(values)}\r\n".encode()
+
+
+formatter = Formatter()
+
+
+# ==========================
+# STORAGE
+# ==========================
 @dataclass
 class Value:
     item: Any
@@ -17,138 +97,96 @@ class Value:
 
 class Storage:
     def __init__(self):
-        self.data: dict[str, Value] = {}
+        self.data: dict[Any, Any] = {}
 
     def set(self, key: str, value: Value) -> None:
         self.data[key] = value
 
-    def get(self, key: str) -> Optional[str]:
+    def rpush(self, key: str, value: Value) -> list[Value]:
+        if key in self.data and isinstance(self.data[key], list):
+            self.data[key].append(value)
+        elif key not in self.data:
+            self.data[key] = [value]
+        else:
+            raise RuntimeError(f"Key {key} exists and is not a list")
+        return self.data[key]
+
+    def get(self, key: str) -> Any:
         if key not in self.data:
             return None
-
         val = self.data[key]
-
-        # Check expiry
-        if val.expire is not None and datetime.now() > val.expire:
-            del self.data[key]
+        if isinstance(val, Value) and val.expire and val.expire <= datetime.now():
             return None
+        return val
 
-        return val.item
-
-
-# -------------------------------
-# RESP Protocol Helpers
-# -------------------------------
-
-def parse_resp(data: bytes) -> list[str]:
-    """Parse a RESP array like *3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n"""
-    parts = data.split(b"\r\n")
-    items = []
-    i = 0
-    while i < len(parts):
-        if not parts[i]:
-            i += 1
-            continue
-        if parts[i].startswith(b"$"):
-            # Next line is the actual data
-            items.append(parts[i + 1].decode())
-            i += 2
-        else:
-            i += 1
-    return [x.upper() if idx == 0 else x for idx, x in enumerate(items)]
-
-
-def encode_bulk_string(value: Optional[str]) -> bytes:
-    if value is None:
-        return b"$-1\r\n"
-    return f"${len(value)}\r\n{value}\r\n".encode()
-
-
-def encode_simple_string(msg: str) -> bytes:
-    return f"+{msg}\r\n".encode()
-
-
-def encode_integer(num: int) -> bytes:
-    return f":{num}\r\n".encode()
-
-
-# -------------------------------
-# Command Handling
-# -------------------------------
 
 storage = Storage()
 
 
-def handle_command(command: str, args: list[str]) -> bytes:
-    if command == "PING":
-        return encode_simple_string("PONG")
+# ==========================
+# PROCESSOR
+# ==========================
+async def process_command(command: tuple[Command, str, ...], writer: Any) -> None:
+    """Process a single Redis-like command and send the result."""
 
-    elif command == "ECHO":
-        return encode_bulk_string(args[0] if args else "")
+    if command[0] == Command.ECHO:
+        writer.write(formatter.format_echo_expression(command[1:]))
 
-    elif command == "SET":
-        key = args[0]
-        value = args[1]
-        expire_time = None
+    elif command[0] == Command.SET:
+        req = command[1:]
+        key, value = req[1], req[2]
+        if len(req) > 3:
+            expiration = (
+                datetime.now() + timedelta(seconds=int(req[4]))
+                if req[3].upper() == "EX"
+                else datetime.now() + timedelta(milliseconds=int(req[4]))
+            )
+        else:
+            expiration = None
+        storage.set(key, Value(value, expiration))
+        writer.write(formatter.format_ok_expression())
 
-        # Optional EX / PX
-        if len(args) >= 4:
-            option = args[2].upper()
-            exp_value = int(args[3])
-            if option == "EX":
-                expire_time = datetime.now() + timedelta(seconds=exp_value)
-            elif option == "PX":
-                expire_time = datetime.now() + timedelta(milliseconds=exp_value)
+    elif command[0] == Command.GET:
+        key = command[2]
+        val = storage.get(key)
+        writer.write(formatter.format_get_response(val))
 
-        storage.set(key, Value(value, expire_time))
-        return encode_simple_string("OK")
+    elif command[0] == Command.PING:
+        writer.write(b"+PONG\r\n")
 
-    elif command == "GET":
-        key = args[0]
-        value = storage.get(key)
-        return encode_bulk_string(value)
+    elif command[0] == Command.RPUSH:
+        key = command[2]
+        val = command[3]
+        result = storage.rpush(key, Value(val))
+        writer.write(formatter.format_rpush_response(result))
 
-    else:
-        return encode_simple_string("ERR unknown command")
+    await writer.drain()
 
 
-# -------------------------------
-# Networking
-# -------------------------------
-
-def handle_client(conn: socket.socket):
+# ==========================
+# ASYNC SERVER
+# ==========================
+async def handle_client(reader, writer):
     try:
         while True:
-            data = conn.recv(1024)
+            data = await reader.read(1024)
             if not data:
                 break
-
-            parts = parse_resp(data)
-            if not parts:
-                continue
-
-            command = parts[0]
-            args = parts[1:]
-            response = handle_command(command, args)
-            conn.sendall(response)
-
-    except ConnectionResetError:
-        pass
+            cmd = parser.parse_command(data)
+            await process_command(cmd, writer)
+    except Exception as e:
+        print(f"Error: {e}")
     finally:
-        conn.close()
+        writer.close()
+        await writer.wait_closed()
 
 
-def main():
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("localhost", 6379))
-    server.listen(5)
-    print("Redis clone running on port 6379...")
-
-    while True:
-        conn, _ = server.accept()
-        threading.Thread(target=handle_client, args=(conn,), daemon=True).start()
+async def main():
+    print("Logs from your program will appear here!")
+    server = await asyncio.start_server(handle_client, "localhost", 6379)
+    async with server:
+        await server.serve_forever()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
