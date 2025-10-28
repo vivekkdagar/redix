@@ -1,170 +1,247 @@
-import socket
-import threading
+import asyncio
+import time
+from collections import deque
 
-# In-memory data store
-data_store = {}
+# ==============================
+# REDIS CONSTANTS
+# ==============================
+ECHO_COMMAND = "ECHO"
+PING_COMMAND = "PING"
+SET_COMMAND = "SET"
+GET_COMMAND = "GET"
+RPUSH_COMMAND = "RPUSH"
+LPUSH_COMMAND = "LPUSH"
+LRANGE_COMMAND = "LRANGE"
+LPOP_COMMAND = "LPOP"
+LLEN_COMMAND = "LLEN"
 
-# --- RESP ENCODING HELPERS ---
+PONG_RESP = b"+PONG\r\n"
+OK_RESP = b"+OK\r\n"
+NULL_RESP = b"$-1\r\n"
+EMPTY_ARRAY = b"*0\r\n"
 
-def encode_bulk_string(s):
-    return f"${len(s)}\r\n{s}\r\n"
-
-def encode_simple_string(s):
-    return f"+{s}\r\n"
-
-def encode_integer(i):
-    return f":{i}\r\n"
-
-def encode_null_bulk_string():
-    return "$-1\r\n"
-
-def encode_array(arr):
-    resp = f"*{len(arr)}\r\n"
-    for el in arr:
-        resp += encode_bulk_string(el)
-    return resp
+# ==============================
+# IN-MEMORY DATABASE
+# ==============================
+REDIS_DATABASE = {}
 
 
-# --- RESP PARSER ---
-def parse_request(data):
-    lines = data.split("\r\n")
-    if not lines or not lines[0].startswith("*"):
+# ==============================
+# DATA HELPERS
+# ==============================
+def get_data_from_redis(key):
+    """Get value (with expiry check)"""
+    data = REDIS_DATABASE.get(key)
+    if data is None:
         return None
-    try:
-        count = int(lines[0][1:])
-        args = []
-        i = 1
-        while i < len(lines) and len(args) < count:
-            if lines[i].startswith("$"):
-                args.append(lines[i + 1])
-                i += 2
-            else:
-                i += 1
-        return args
-    except Exception:
+    if "exp" in data and data["exp"]:
+        now = int(time.time() * 1000)
+        if now > data["exp"]:
+            del REDIS_DATABASE[key]
+            return None
+    return data["value"]
+
+
+def add_data_to_redis(key, value, exp=None):
+    """Add key-value pair with optional expiration"""
+    now = int(time.time() * 1000)
+    REDIS_DATABASE[key] = {"value": value, "exp": now + exp if exp else None}
+
+
+def add_data_to_redis_list(key, values, side):
+    """Append or prepend elements to a list"""
+    if key not in REDIS_DATABASE:
+        REDIS_DATABASE[key] = {"value": deque(), "exp": None}
+
+    if side == "left":
+        for v in values:
+            REDIS_DATABASE[key]["value"].appendleft(v)
+    else:
+        for v in values:
+            REDIS_DATABASE[key]["value"].append(v)
+
+    return len(REDIS_DATABASE[key]["value"])
+
+
+def remove_data_from_redis_list(key, count=None):
+    """Pop one or multiple elements from list"""
+    if key not in REDIS_DATABASE:
         return None
 
+    dq = REDIS_DATABASE[key]["value"]
 
-# --- CLIENT HANDLER ---
-def handle_client(conn):
-    buffer = ""
-    while True:
-        try:
-            data = conn.recv(1024)
-            if not data:
-                break
-            buffer += data.decode()
-            if "\r\n" not in buffer:
-                continue
+    if not dq:
+        return None
 
-            request = parse_request(buffer)
-            buffer = ""
+    if count is None:
+        return dq.popleft()
 
-            if not request:
-                continue
-
-            command = request[0].upper()
-
-            # --- CORE COMMANDS ---
-
-            if command == "PING":
-                conn.sendall(encode_simple_string("PONG").encode())
-
-            elif command == "ECHO":
-                if len(request) > 1:
-                    conn.sendall(encode_bulk_string(request[1]).encode())
-                else:
-                    conn.sendall(encode_null_bulk_string().encode())
-
-            elif command == "SET":
-                key, value = request[1], request[2]
-                data_store[key] = value
-                conn.sendall(encode_simple_string("OK").encode())
-
-            elif command == "GET":
-                key = request[1]
-                val = data_store.get(key)
-                if val is None:
-                    conn.sendall(encode_null_bulk_string().encode())
-                else:
-                    conn.sendall(encode_bulk_string(val).encode())
-
-            # --- LIST COMMANDS ---
-
-            elif command == "RPUSH":
-                key = request[1]
-                values = request[2:]
-                if key not in data_store:
-                    data_store[key] = []
-                data_store[key].extend(values)
-                conn.sendall(encode_integer(len(data_store[key])).encode())
-
-            elif command == "LPUSH":
-                key = request[1]
-                values = request[2:]
-                if key not in data_store:
-                    data_store[key] = []
-                # prepend (reverse order like Redis)
-                for v in values:
-                    data_store[key].insert(0, v)
-                conn.sendall(encode_integer(len(data_store[key])).encode())
-
-            elif command == "LLEN":
-                key = request[1]
-                length = len(data_store.get(key, []))
-                conn.sendall(encode_integer(length).encode())
-
-            elif command == "LRANGE":
-                key = request[1]
-                start, end = int(request[2]), int(request[3])
-                lst = data_store.get(key, [])
-                if end < 0:
-                    end = len(lst) + end
-                result = lst[start:end + 1]
-                conn.sendall(encode_array(result).encode())
-
-            elif command == "LPOP":
-                key = request[1]
-                lst = data_store.get(key, [])
-
-                if len(request) == 2:  # single pop
-                    if not lst:
-                        conn.sendall(encode_null_bulk_string().encode())
-                    else:
-                        val = lst.pop(0)
-                        conn.sendall(encode_bulk_string(val).encode())
-
-                elif len(request) == 3:  # multiple pop
-                    count = int(request[2])
-                    if not lst:
-                        conn.sendall(encode_array([]).encode())
-                    else:
-                        popped = lst[:count]
-                        data_store[key] = lst[count:]
-                        conn.sendall(encode_array(popped).encode())
-
-            else:
-                conn.sendall(encode_simple_string("ERR unknown command").encode())
-
-        except Exception:
+    popped = []
+    for _ in range(int(count)):
+        if not dq:
             break
+        popped.append(dq.popleft())
+    return popped
 
-    conn.close()
+
+# ==============================
+# RESP CONVERTERS
+# ==============================
+def convert_str_to_redis_response(output):
+    return f"${len(output)}\r\n{output}\r\n".encode()
 
 
-# --- MAIN SERVER ---
-def main():
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("localhost", 6379))
-    server.listen()
+def convert_int_to_redis_response(output):
+    return f":{output}\r\n".encode()
 
-    print("Redis clone running on port 6379")
 
+def convert_array_to_redis_response(output):
+    resp = f"*{len(output)}\r\n"
+    for el in output:
+        resp += f"${len(el)}\r\n{el}\r\n"
+    return resp.encode()
+
+
+# ==============================
+# COMMAND PARSERS
+# ==============================
+def parse_echo_command(keywords, index):
+    return convert_str_to_redis_response(keywords[index + 2])
+
+
+def parse_ping_command(*args, **kwargs):
+    return PONG_RESP
+
+
+def parse_set_command(keywords, index):
+    key = keywords[index + 2]
+    value = keywords[index + 4]
+    exp_value = None
+
+    if len(keywords) > index + 5:
+        exp_key = keywords[index + 6]
+        exp_value = keywords[index + 8]
+        if exp_key == "EX":
+            exp_value = int(exp_value) * 1000
+        else:
+            exp_value = int(exp_value)
+
+    add_data_to_redis(key, value, exp_value)
+    return OK_RESP
+
+
+def parse_get_command(keywords, index):
+    key = keywords[index + 2]
+    val = get_data_from_redis(key)
+    if val is None:
+        return NULL_RESP
+    return convert_str_to_redis_response(val)
+
+
+def parse_push_command(keywords, index, side):
+    key = keywords[index + 2]
+    to_add = []
+    start = index + 4
+    while start < len(keywords):
+        to_add.append(keywords[start])
+        start += 2
+
+    resp = add_data_to_redis_list(key, to_add, side)
+    return convert_int_to_redis_response(resp)
+
+
+def parse_lpush_command(keywords, index):
+    return parse_push_command(keywords, index, "left")
+
+
+def parse_rpush_command(keywords, index):
+    return parse_push_command(keywords, index, "right")
+
+
+def parse_lrange_command(keywords, index):
+    key = keywords[index + 2]
+    start = int(keywords[index + 4])
+    end = int(keywords[index + 6])
+    val = get_data_from_redis(key)
+    if val is None:
+        return EMPTY_ARRAY
+
+    val = list(val)
+    if end == -1:
+        sliced = val[start:]
+    else:
+        sliced = val[start:end + 1]
+    return convert_array_to_redis_response(sliced)
+
+
+def parse_lpop_command(keywords, index):
+    key = keywords[index + 2]
+    count = None
+    if len(keywords) > index + 3:
+        count = keywords[index + 4]
+
+    resp = remove_data_from_redis_list(key, count)
+    if resp is None:
+        return NULL_RESP
+    if isinstance(resp, list):
+        return convert_array_to_redis_response(resp)
+    return convert_str_to_redis_response(resp)
+
+
+def parse_llen_command(keywords, index):
+    key = keywords[index + 2]
+    val = get_data_from_redis(key)
+    if val is None:
+        return convert_int_to_redis_response(0)
+    return convert_int_to_redis_response(len(val))
+
+
+# ==============================
+# REDIS COMMAND DISPATCHER
+# ==============================
+command_arg_map = {
+    ECHO_COMMAND: parse_echo_command,
+    PING_COMMAND: parse_ping_command,
+    SET_COMMAND: parse_set_command,
+    GET_COMMAND: parse_get_command,
+    RPUSH_COMMAND: parse_rpush_command,
+    LPUSH_COMMAND: parse_lpush_command,
+    LRANGE_COMMAND: parse_lrange_command,
+    LPOP_COMMAND: parse_lpop_command,
+    LLEN_COMMAND: parse_llen_command,
+}
+
+
+def parse_redis_command(data):
+    keywords = [kw for kw in data.split("\r\n") if kw]
+    i = 1
+    command = keywords[i + 1].upper()
+    func = command_arg_map.get(command)
+    if func:
+        return func(keywords, i + 1)
+    return b"-ERR unknown command\r\n"
+
+
+# ==============================
+# ASYNCIO SERVER
+# ==============================
+async def handle_client(reader, writer):
     while True:
-        conn, _ = server.accept()
-        threading.Thread(target=handle_client, args=(conn,)).start()
+        data = await reader.read(1024)
+        if not data:
+            break
+        response = parse_redis_command(data.decode())
+        writer.write(response)
+        await writer.drain()
+    writer.close()
+
+
+async def main():
+    print("Redis clone running on port 6379")
+    server = await asyncio.start_server(handle_client, "localhost", 6379)
+    async with server:
+        await server.serve_forever()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
