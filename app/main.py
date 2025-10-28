@@ -3,114 +3,118 @@ import threading
 import time
 
 store = {}
+expiry = {}
+
+def cleanup_expired_keys():
+    current_time = time.time()
+    expired = [key for key, exp in expiry.items() if exp <= current_time]
+    for key in expired:
+        store.pop(key, None)
+        expiry.pop(key, None)
+
+def encode_bulk_string(value):
+    if value is None:
+        return b"$-1\r\n"
+    return f"${len(value)}\r\n{value}\r\n".encode()
+
+def encode_integer(num):
+    return f":{num}\r\n".encode()
+
+def encode_array(items):
+    resp = f"*{len(items)}\r\n"
+    for item in items:
+        resp += f"${len(item)}\r\n{item}\r\n"
+    return resp.encode()
 
 def handle_client(conn):
-    with conn:
-        while True:
+    while True:
+        try:
             data = conn.recv(1024)
             if not data:
                 break
 
-            parts = data.split(b"\r\n")
-            if len(parts) < 3:
+            parts = data.decode().strip().split("\r\n")
+            if len(parts) < 2:
                 continue
 
-            try:
-                command = parts[2].decode().upper()
-            except:
-                continue
+            command = parts[2].upper()
+            args = [p for i, p in enumerate(parts) if i >= 4 and i % 2 == 0]
 
-            # --- RESP Command Handling ---
+            cleanup_expired_keys()
+
+            # --- PING ---
             if command == "PING":
-                conn.sendall(b"+PONG\r\n")
+                conn.send(b"+PONG\r\n")
 
-            elif command == "ECHO":
-                message = parts[4]
-                conn.sendall(b"$" + str(len(message)).encode() + b"\r\n" + message + b"\r\n")
+            # --- ECHO ---
+            elif command == "ECHO" and args:
+                conn.send(encode_bulk_string(args[0]))
 
-            elif command == "SET":
-                key = parts[4].decode()
-                value = parts[6].decode()
-                if len(parts) > 8 and parts[8].decode().upper() == "PX":
-                    expiry = int(parts[10].decode()) / 1000
-                    store[key] = (value, time.time() + expiry)
-                else:
-                    store[key] = (value, None)
-                conn.sendall(b"+OK\r\n")
+            # --- SET ---
+            elif command == "SET" and len(args) >= 2:
+                key, value = args[0], args[1]
+                store[key] = value
+                if len(args) == 4 and args[2].upper() == "PX":
+                    expiry[key] = time.time() + int(args[3]) / 1000
+                conn.send(b"+OK\r\n")
 
-            elif command == "GET":
-                key = parts[4].decode()
+            # --- GET ---
+            elif command == "GET" and len(args) == 1:
+                key = args[0]
+                val = store.get(key)
+                conn.send(encode_bulk_string(val))
+
+            # --- RPUSH ---
+            elif command == "RPUSH" and len(args) >= 2:
+                key = args[0]
+                values = args[1:]
                 if key not in store:
-                    conn.sendall(b"$-1\r\n")
-                else:
-                    value, expiry = store[key]
-                    if expiry and expiry < time.time():
-                        del store[key]
-                        conn.sendall(b"$-1\r\n")
-                    else:
-                        conn.sendall(b"$" + str(len(value)).encode() + b"\r\n" + value.encode() + b"\r\n")
+                    store[key] = []
+                store[key].extend(values)
+                conn.send(encode_integer(len(store[key])))
 
-            # --- LIST COMMANDS ---
-
-            elif command == "RPUSH":
-                key = parts[4].decode()
-                values = [parts[i].decode() for i in range(6, len(parts) - 1, 2)]
-
+            # --- LPUSH ---
+            elif command == "LPUSH" and len(args) >= 2:
+                key = args[0]
+                values = args[1:]
                 if key not in store:
-                    store[key] = ([], None)
-
-                lst, expiry = store[key]
-                lst.extend(values)
-                store[key] = (lst, expiry)
-
-                response = b":" + str(len(lst)).encode() + b"\r\n"
-                conn.sendall(response)
-
-            elif command == "LPUSH":
-                key = parts[4].decode()
-                values = [parts[i].decode() for i in range(6, len(parts) - 1, 2)]
-
-                if key not in store:
-                    store[key] = ([], None)
-
-                lst, expiry = store[key]
+                    store[key] = []
                 for v in values:
-                    lst.insert(0, v)
-                store[key] = (lst, expiry)
+                    store[key].insert(0, v)
+                conn.send(encode_integer(len(store[key])))
 
-                response = b":" + str(len(lst)).encode() + b"\r\n"
-                conn.sendall(response)
+            # --- LLEN ---
+            elif command == "LLEN" and len(args) == 1:
+                key = args[0]
+                length = len(store.get(key, []))
+                conn.send(encode_integer(length))
 
-            elif command == "LLEN":
-                key = parts[4].decode()
-                if key not in store:
-                    conn.sendall(b":0\r\n")
-                else:
-                    lst, expiry = store[key]
-                    conn.sendall(b":" + str(len(lst)).encode() + b"\r\n")
-
-            elif command == "LRANGE":
-                key = parts[4].decode()
-                start = int(parts[6].decode())
-                end = int(parts[8].decode())
-
-                if key not in store:
-                    conn.sendall(b"*0\r\n")
-                    continue
-
-                lst, expiry = store[key]
+            # --- LRANGE ---
+            elif command == "LRANGE" and len(args) == 3:
+                key = args[0]
+                start = int(args[1])
+                end = int(args[2])
+                lst = store.get(key, [])
                 if end == -1:
-                    sublist = lst[start:]
-                else:
-                    sublist = lst[start:end + 1]
+                    end = len(lst) - 1
+                conn.send(encode_array(lst[start:end + 1]))
 
-                conn.sendall(b"*" + str(len(sublist)).encode() + b"\r\n")
-                for item in sublist:
-                    conn.sendall(b"$" + str(len(item)).encode() + b"\r\n" + item.encode() + b"\r\n")
+            # --- LPOP (new) ---
+            elif command == "LPOP" and len(args) == 1:
+                key = args[0]
+                lst = store.get(key)
+                if not lst:
+                    conn.send(b"$-1\r\n")
+                else:
+                    value = lst.pop(0)
+                    conn.send(encode_bulk_string(value))
 
             else:
-                conn.sendall(b"-ERR unknown command\r\n")
+                conn.send(b"-ERR unknown command\r\n")
 
+        except Exception as e:
+            conn.send(b"-ERR internal error\r\n")
+            break
 
 def main():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -120,7 +124,6 @@ def main():
     while True:
         conn, _ = server.accept()
         threading.Thread(target=handle_client, args=(conn,)).start()
-
 
 if __name__ == "__main__":
     main()
