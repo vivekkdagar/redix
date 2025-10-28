@@ -1,253 +1,213 @@
 import socket
 import threading
 import time
-from datetime import datetime, timedelta
-from typing import Any, List
-from collections import defaultdict
 
-# ============================
-# RESP DATA TYPES
-# ============================
+# In-memory database
+data_store = {}
+expiry = {}
 
-class RESPType:
-    def encode(self) -> str: ...
-    def decode(self) -> Any: ...
-    @classmethod
-    def parse(cls, content: bytes): ...
+def set_key(key, value, px=None):
+    data_store[key] = value
+    if px:
+        expiry[key] = time.time() + (px / 1000)
+    elif key in expiry:
+        del expiry[key]
 
-class SimpleString(RESPType):
-    def __init__(self, string): self.data = string
-    def encode(self): return f"+{self.data}\r\n"
-    def decode(self): return self.data
-    @classmethod
-    def parse(cls, content: bytes):
-        p = 1
-        data = bytearray()
-        while content[p] != ord('\r'):
-            data.append(content[p]); p += 1
-        p += 2
-        return cls(data.decode()), content[p:]
+def get_key(key):
+    if key in expiry and time.time() > expiry[key]:
+        del data_store[key]
+        del expiry[key]
+        return None
+    return data_store.get(key)
 
-class SimpleError(RESPType):
-    def __init__(self, string): self.data = string
-    def encode(self): return f"-{self.data}\r\n"
-    def decode(self): return self.data
-    @classmethod
-    def parse(cls, content: bytes):
-        p = 1
-        data = bytearray()
-        while content[p] != ord('\r'):
-            data.append(content[p]); p += 1
-        p += 2
-        return cls(data.decode()), content[p:]
+def encode_bulk_string(value):
+    if value is None:
+        return b"$-1\r\n"
+    return f"${len(value)}\r\n{value}\r\n".encode()
 
-class Integer(RESPType):
-    def __init__(self, num): self.data = num
-    def encode(self): return f":{self.data}\r\n"
-    def decode(self): return self.data
-    @classmethod
-    def parse(cls, content: bytes):
-        p = 1
-        data = bytearray()
-        while content[p] != ord('\r'):
-            data.append(content[p]); p += 1
-        p += 2
-        return cls(int(data.decode())), content[p:]
+def encode_simple_string(value):
+    return f"+{value}\r\n".encode()
 
-class BulkString(RESPType):
-    def __init__(self, string, length=None):
-        self.data = string
-        self.length = len(string) if length is None else length
-    def encode(self):
-        if self.length == -1: return "$-1\r\n"
-        return f"${self.length}\r\n{self.data}\r\n"
-    def decode(self): return self.data
-    @classmethod
-    def parse(cls, content: bytes):
-        p = 1
-        length = bytearray()
-        while content[p] != ord('\r'):
-            length.append(content[p]); p += 1
-        p += 2
-        length = int(length.decode())
-        if length == -1: return cls("", -1), content[p:]
-        data = bytearray()
-        while content[p] != ord('\r'):
-            data.append(content[p]); p += 1
-        p += 2
-        return cls(data.decode(), length), content[p:]
+def encode_integer(value):
+    return f":{value}\r\n".encode()
 
-class Array(RESPType):
-    def __init__(self, arr: List[RESPType]):
-        self.data = arr
-        self.length = len(arr)
-    def encode(self):
-        out = f"*{self.length}\r\n"
-        for item in self.data: out += item.encode()
-        return out
-    def decode(self): return [x.decode() for x in self.data]
-    def __getitem__(self, i): return self.data[i]
-    @classmethod
-    def parse(cls, content: bytes):
-        p = 1
-        length = bytearray()
-        while content[p] != ord('\r'):
-            length.append(content[p]); p += 1
-        p += 2
-        length = int(length.decode())
-        arr = []
-        rest = content[p:]
-        for _ in range(length):
-            t = rest[:1].decode()
-            if t == '+': x, rest = SimpleString.parse(rest)
-            elif t == '-': x, rest = SimpleError.parse(rest)
-            elif t == ':': x, rest = Integer.parse(rest)
-            elif t == '$': x, rest = BulkString.parse(rest)
-            elif t == '*': x, rest = Array.parse(rest)
-            arr.append(x)
-        return cls(arr), rest
-
-
-# ============================
-# REDIS COMMANDS
-# ============================
-
-_LISTS = defaultdict(list)
-_DATA = {}
-_BLOCKED = defaultdict(list)  # key -> list of waiting clients
-
-class SetEntry:
-    def __init__(self, val, expiry=None):
-        self._val = val
-        self.expire = datetime.now() + timedelta(milliseconds=int(expiry)) if expiry else None
-    @property
-    def value(self):
-        if self.expire and datetime.now() > self.expire: return None
-        return self._val
-
-
-def cmd_ping(args): return SimpleString("PONG")
-def cmd_echo(args): return BulkString(args[0].decode())
-
-def cmd_set(args):
-    key, val = args[0].decode(), args[1].decode()
-    px = None
-    if len(args) > 2:
-        opts = [a.decode().lower() for a in args[2:]]
-        if "px" in opts:
-            px_index = opts.index("px")
-            px = args[px_index+3].decode() if len(args) > px_index+3 else args[px_index+1].decode()
-    _DATA[key] = SetEntry(val, px)
-    return SimpleString("OK")
-
-def cmd_get(args):
-    key = args[0].decode()
-    entry = _DATA.get(key)
-    if not entry or entry.value is None:
-        return BulkString("", -1)
-    return BulkString(entry.value)
-
-def cmd_rpush(args, client=None):
-    key = args[0].decode()
-    values = [v.decode() for v in args[1:]]
-    # If blocked clients exist, wake one
-    if key in _BLOCKED and len(_BLOCKED[key]) > 0:
-        waiting_client = _BLOCKED[key].pop(0)
-        value = values[0]
-        resp = Array([BulkString(key), BulkString(value)])
-        waiting_client.sendall(resp.encode().encode())
-        return Integer(1)
-    _LISTS[key].extend(values)
-    return Integer(len(_LISTS[key]))
-
-def cmd_lpush(args):
-    key = args[0].decode()
-    values = [v.decode() for v in args[1:]]
+def encode_array(values):
+    res = f"*{len(values)}\r\n"
     for v in values:
-        _LISTS[key].insert(0, v)
-    return Integer(len(_LISTS[key]))
+        if v is None:
+            res += "$-1\r\n"
+        else:
+            res += f"${len(v)}\r\n{v}\r\n"
+    return res.encode()
 
-def cmd_llen(args):
-    key = args[0].decode()
-    return Integer(len(_LISTS[key]))
+def parse_request(data):
+    lines = data.split(b"\r\n")
+    parts = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith(b"*") or line == b"":
+            i += 1
+            continue
+        if line.startswith(b"$"):
+            length = int(line[1:])
+            i += 1
+            parts.append(lines[i].decode())
+        i += 1
+    return parts
 
-def cmd_lpop(args):
-    key = args[0].decode()
-    n = 1
-    if len(args) > 1: n = int(args[1].decode())
-    if key not in _LISTS or len(_LISTS[key]) == 0:
-        return BulkString("", -1)
-    vals = []
-    for _ in range(min(n, len(_LISTS[key]))):
-        vals.append(BulkString(_LISTS[key].pop(0)))
-    if n == 1: return vals[0]
-    return Array(vals)
-
-def cmd_lrange(args):
-    key = args[0].decode()
-    start, end = int(args[1].decode()), int(args[2].decode())
-    lst = _LISTS.get(key, [])
-    start = len(lst) + start if start < 0 else start
-    end = len(lst) + end if end < 0 else end
-    end = min(end+1, len(lst))
-    return Array([BulkString(v) for v in lst[start:end]])
-
-def cmd_blpop(args, client=None):
-    key = args[0].decode()
-    timeout = int(args[1].decode())
+def handle_client(conn):
     while True:
-        if len(_LISTS[key]) > 0:
-            value = _LISTS[key].pop(0)
-            return Array([BulkString(key), BulkString(value)])
-        # Block indefinitely (timeout = 0)
-        _BLOCKED[key].append(client)
-        time.sleep(0.1)  # Yield control
+        data = b""
+        try:
+            chunk = conn.recv(1024)
+            if not chunk:
+                break
+            data += chunk
+        except:
+            break
 
+        if not data:
+            break
 
-COMMANDS = {
-    "ping": cmd_ping,
-    "echo": cmd_echo,
-    "set": cmd_set,
-    "get": cmd_get,
-    "rpush": cmd_rpush,
-    "lpush": cmd_lpush,
-    "llen": cmd_llen,
-    "lpop": cmd_lpop,
-    "lrange": cmd_lrange,
-    "blpop": cmd_blpop
-}
+        parts = parse_request(data)
+        if not parts:
+            continue
 
+        cmd = parts[0].upper()
 
-# ============================
-# SERVER
-# ============================
+        # ----------------------------
+        # PING
+        # ----------------------------
+        if cmd == "PING":
+            response = encode_simple_string("PONG")
 
-def handle_client(con, addr):
-    try:
-        while True:
-            data = con.recv(1024)
-            if not data: break
-            arr, _ = Array.parse(data)
-            cmd = arr[0].decode().lower()
-            args = arr[1:]
-            if cmd in ["rpush", "blpop"]:
-                res = COMMANDS[cmd](args, con)
-                if res is None: continue  # handled by another client
+        # ----------------------------
+        # ECHO
+        # ----------------------------
+        elif cmd == "ECHO":
+            response = encode_bulk_string(parts[1])
+
+        # ----------------------------
+        # SET
+        # ----------------------------
+        elif cmd == "SET":
+            key, value = parts[1], parts[2]
+            px = None
+            if len(parts) > 4 and parts[3].upper() == "PX":
+                px = int(parts[4])
+            set_key(key, value, px)
+            response = encode_simple_string("OK")
+
+        # ----------------------------
+        # GET
+        # ----------------------------
+        elif cmd == "GET":
+            value = get_key(parts[1])
+            response = encode_bulk_string(value)
+
+        # ----------------------------
+        # LPUSH / RPUSH
+        # ----------------------------
+        elif cmd in ["LPUSH", "RPUSH"]:
+            key = parts[1]
+            values = parts[2:]
+
+            if key not in data_store or not isinstance(data_store[key], list):
+                data_store[key] = []
+
+            if cmd == "LPUSH":
+                data_store[key] = list(reversed(values)) + data_store[key]
             else:
-                res = COMMANDS.get(cmd, lambda _: SimpleError("ERR unknown command"))(args)
-            con.sendall(res.encode().encode())
-    except Exception as e:
-        print("Client error:", e)
-    finally:
-        con.close()
+                data_store[key].extend(values)
+
+            response = encode_integer(len(data_store[key]))
+
+        # ----------------------------
+        # LLEN
+        # ----------------------------
+        elif cmd == "LLEN":
+            key = parts[1]
+            length = len(data_store.get(key, [])) if isinstance(data_store.get(key, []), list) else 0
+            response = encode_integer(length)
+
+        # ----------------------------
+        # LRANGE
+        # ----------------------------
+        elif cmd == "LRANGE":
+            key, start, end = parts[1], int(parts[2]), int(parts[3])
+            arr = data_store.get(key, [])
+            if not isinstance(arr, list):
+                arr = []
+
+            # Handle negative indices
+            n = len(arr)
+            if start < 0:
+                start = n + start
+            if end < 0:
+                end = n + end
+            start = max(start, 0)
+            end = min(end, n - 1)
+
+            if start > end or n == 0:
+                result = []
+            else:
+                result = arr[start:end + 1]
+
+            response = encode_array(result)
+
+        # ----------------------------
+        # LPOP / RPOP
+        # ----------------------------
+        elif cmd in ["LPOP", "RPOP"]:
+            key = parts[1]
+            count = 1
+            if len(parts) > 2:
+                try:
+                    count = int(parts[2])
+                except:
+                    count = 1
+
+            arr = data_store.get(key, [])
+            if not isinstance(arr, list) or not arr:
+                response = encode_bulk_string(None)
+            else:
+                if cmd == "LPOP":
+                    popped = arr[:count]
+                    data_store[key] = arr[count:]
+                else:
+                    popped = arr[-count:]
+                    data_store[key] = arr[:-count]
+
+                if count == 1:
+                    response = encode_bulk_string(popped[0])
+                else:
+                    response = encode_array(popped)
+
+        # ----------------------------
+        # Default
+        # ----------------------------
+        else:
+            response = encode_simple_string("UNKNOWN")
+
+        conn.sendall(response)
+    conn.close()
+
 
 def main():
-    HOST, PORT = "localhost", 6379
-    print(f"Listening on {HOST}:{PORT}")
-    s = socket.create_server((HOST, PORT), reuse_port=True)
+    HOST = "localhost"
+    PORT = 6379
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((HOST, PORT))
+    server.listen()
+
+    print("Redis clone running on port 6379")
+
     while True:
-        con, addr = s.accept()
-        threading.Thread(target=handle_client, args=(con, addr), daemon=True).start()
+        conn, _ = server.accept()
+        threading.Thread(target=handle_client, args=(conn,), daemon=True).start()
+
 
 if __name__ == "__main__":
     main()
