@@ -1,19 +1,24 @@
 import socket
 import threading
 import time
+import sys
 from collections import defaultdict
 
 # ==============================
-# In-memory data store
+# Global stores
 # ==============================
 data_store = {}
 expiry_store = {}
-
-# For blocking list operations
 blocking_conditions = defaultdict(threading.Condition)
 
+# Default config values (overridden via CLI args)
+config = {
+    "dir": "/tmp",
+    "dbfilename": "dump.rdb"
+}
+
 # ==============================
-# RESP encoding helpers
+# RESP helpers
 # ==============================
 def encode_simple_string(s):
     return f"+{s}\r\n".encode()
@@ -41,13 +46,48 @@ def encode_array(items):
     return out.encode()
 
 # ==============================
-# Command Implementations
+# RESP parser (binary-safe)
+# ==============================
+def read_line(conn):
+    buf = b""
+    while not buf.endswith(b"\r\n"):
+        chunk = conn.recv(1)
+        if not chunk:
+            return None
+        buf += chunk
+    return buf[:-2].decode()
+
+def parse_resp_message(conn):
+    line = read_line(conn)
+    if not line:
+        return None
+    if line[0] != '*':
+        return None
+    num_args = int(line[1:])
+    args = []
+    for _ in range(num_args):
+        line = read_line(conn)
+        if not line or line[0] != '$':
+            return None
+        length = int(line[1:])
+        if length == -1:
+            args.append(None)
+            continue
+        arg = b""
+        while len(arg) < length:
+            chunk = conn.recv(length - len(arg))
+            if not chunk:
+                return None
+            arg += chunk
+        conn.recv(2)  # consume \r\n
+        args.append(arg.decode())
+    return args
+
+# ==============================
+# Commands
 # ==============================
 def handle_ping(args):
-    if len(args) == 1:
-        return encode_simple_string("PONG")
-    else:
-        return encode_bulk_string(args[1])
+    return encode_bulk_string(args[1]) if len(args) > 1 else encode_simple_string("PONG")
 
 def handle_echo(args):
     return encode_bulk_string(args[1])
@@ -68,32 +108,23 @@ def handle_get(args):
         return encode_bulk_string(None)
     return encode_bulk_string(data_store.get(key))
 
-# ==============================
-# List Operations
-# ==============================
 def handle_lpush(args):
-    key = args[1]
-    values = args[2:]
+    key, values = args[1], args[2:]
     if key not in data_store:
         data_store[key] = []
     for v in values:
         data_store[key].insert(0, v)
-    # Notify waiting BLPOP threads
-    cond = blocking_conditions[key]
-    with cond:
-        cond.notify_all()
+    with blocking_conditions[key]:
+        blocking_conditions[key].notify_all()
     return encode_integer(len(data_store[key]))
 
 def handle_rpush(args):
-    key = args[1]
-    values = args[2:]
+    key, values = args[1], args[2:]
     if key not in data_store:
         data_store[key] = []
     data_store[key].extend(values)
-    # Notify waiting BLPOP threads
-    cond = blocking_conditions[key]
-    with cond:
-        cond.notify_all()
+    with blocking_conditions[key]:
+        blocking_conditions[key].notify_all()
     return encode_integer(len(data_store[key]))
 
 def handle_lrange(args):
@@ -102,10 +133,8 @@ def handle_lrange(args):
         return encode_array([])
     lst = data_store[key]
     n = len(lst)
-    if start < 0:
-        start = n + start
-    if end < 0:
-        end = n + end
+    if start < 0: start = n + start
+    if end < 0: end = n + end
     start = max(start, 0)
     end = min(end, n - 1)
     if start > end:
@@ -114,9 +143,7 @@ def handle_lrange(args):
 
 def handle_llen(args):
     key = args[1]
-    if key not in data_store:
-        return encode_integer(0)
-    return encode_integer(len(data_store[key]))
+    return encode_integer(len(data_store.get(key, [])))
 
 def handle_lpop(args):
     key = args[1]
@@ -124,86 +151,56 @@ def handle_lpop(args):
     if key not in data_store or len(data_store[key]) == 0:
         return encode_bulk_string(None) if count == 1 else encode_array([])
     lst = data_store[key]
-    popped = []
-    for _ in range(min(count, len(lst))):
-        popped.append(lst.pop(0))
+    popped = [lst.pop(0) for _ in range(min(count, len(lst)))]
     if count == 1:
         return encode_bulk_string(popped[0])
     return encode_array(popped)
 
-# ==============================
-# BLPOP (Blocking pop)
-# ==============================
 def handle_blpop(args):
     keys = args[1:-1]
     timeout = float(args[-1])
-    end_time = time.time() + timeout
+    end_time = time.time() + timeout if timeout > 0 else None
 
-    while time.time() < end_time:
+    while True:
         for key in keys:
-            if key in data_store and isinstance(data_store[key], list) and len(data_store[key]) > 0:
+            if key in data_store and data_store[key]:
                 val = data_store[key].pop(0)
                 return encode_array([key, val])
-        # Wait for push notification
+        if end_time and time.time() > end_time:
+            return b"*-1\r\n"
         for key in keys:
             cond = blocking_conditions[key]
             with cond:
-                remaining = end_time - time.time()
-                if remaining <= 0:
-                    break
-                cond.wait(timeout=remaining)
-    # Timeout reached, return null array
-    return b"*-1\r\n"
+                cond.wait(timeout=timeout if end_time else None)
+                break
+
+def handle_config_get(args):
+    param = args[1]
+    if param in config:
+        return encode_array([param, config[param]])
+    else:
+        return encode_array([])
 
 # ==============================
-# Command Dispatcher
+# Dispatcher
 # ==============================
 def execute_command(args):
     cmd = args[0].upper()
-    if cmd == "PING":
-        return handle_ping(args)
-    elif cmd == "ECHO":
-        return handle_echo(args)
-    elif cmd == "SET":
-        return handle_set(args)
-    elif cmd == "GET":
-        return handle_get(args)
-    elif cmd == "LPUSH":
-        return handle_lpush(args)
-    elif cmd == "RPUSH":
-        return handle_rpush(args)
-    elif cmd == "LRANGE":
-        return handle_lrange(args)
-    elif cmd == "LLEN":
-        return handle_llen(args)
-    elif cmd == "LPOP":
-        return handle_lpop(args)
-    elif cmd == "BLPOP":
-        return handle_blpop(args)
-    else:
-        return encode_error(f"ERR unknown command '{cmd}'")
+    if cmd == "PING": return handle_ping(args)
+    if cmd == "ECHO": return handle_echo(args)
+    if cmd == "SET": return handle_set(args)
+    if cmd == "GET": return handle_get(args)
+    if cmd == "LPUSH": return handle_lpush(args)
+    if cmd == "RPUSH": return handle_rpush(args)
+    if cmd == "LRANGE": return handle_lrange(args)
+    if cmd == "LLEN": return handle_llen(args)
+    if cmd == "LPOP": return handle_lpop(args)
+    if cmd == "BLPOP": return handle_blpop(args)
+    if cmd == "CONFIG" and len(args) > 1 and args[1].upper() == "GET": return handle_config_get(args[1:])
+    return encode_error(f"ERR unknown command '{cmd}'")
 
 # ==============================
-# RESP parser
-# ==============================
-def parse_resp_message(conn):
-    line = conn.recv(1024).decode()
-    if not line:
-        return None
-    if line[0] != '*':
-        return None
-    num_args = int(line[1:].strip())
-    args = []
-    for _ in range(num_args):
-        conn.recv(1)  # skip $
-        arg_len = int(conn.recv(1024).decode().strip())
-        arg = conn.recv(arg_len).decode()
-        conn.recv(2)  # \r\n
-        args.append(arg)
-    return args
-
-# ==============================
-# Client handler
+# Networking
 # ==============================
 def handle_client(conn):
     try:
@@ -211,22 +208,29 @@ def handle_client(conn):
             args = parse_resp_message(conn)
             if not args:
                 break
-            response = execute_command(args)
-            conn.sendall(response)
+            resp = execute_command(args)
+            conn.sendall(resp)
     except Exception as e:
         print(f"Client error: {e}")
     finally:
         conn.close()
 
 # ==============================
-# Main entrypoint
+# Main
 # ==============================
 def main():
+    # Parse CLI args for --dir and --dbfilename
+    for i, arg in enumerate(sys.argv):
+        if arg == "--dir" and i + 1 < len(sys.argv):
+            config["dir"] = sys.argv[i + 1]
+        elif arg == "--dbfilename" and i + 1 < len(sys.argv):
+            config["dbfilename"] = sys.argv[i + 1]
+
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind(("localhost", 6379))
     server_socket.listen(5)
-    print("Redis clone running on port 6379")
+    print(f"Redis clone running on port 6379 with dir={config['dir']} dbfilename={config['dbfilename']}")
     while True:
         conn, _ = server_socket.accept()
         threading.Thread(target=handle_client, args=(conn,), daemon=True).start()
