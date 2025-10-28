@@ -1,13 +1,19 @@
 import socket
 import threading
+import time
 
-# Global in-memory key-value store
+# In-memory key-value store
 store = {}
+# Expiry timestamps for keys (in milliseconds)
+expiry_map = {}
+
+# Thread lock to prevent race conditions when accessing store and expiry_map
+lock = threading.Lock()
 
 
 def parse_resp(data: bytes):
     """
-    Minimal RESP parser that handles arrays of bulk strings.
+    Minimal RESP parser for arrays of bulk strings.
     Example:
         *3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n
         -> ["SET", "foo", "bar"]
@@ -24,6 +30,26 @@ def parse_resp(data: bytes):
     return items
 
 
+def is_expired(key: str) -> bool:
+    """
+    Passive expiry check.
+    Remove expired keys when accessed.
+    """
+    if key not in expiry_map:
+        return False
+
+    current_time_ms = int(time.time() * 1000)
+    expiry_time = expiry_map[key]
+
+    if current_time_ms >= expiry_time:
+        # Expired: clean up
+        with lock:
+            store.pop(key, None)
+            expiry_map.pop(key, None)
+        return True
+    return False
+
+
 def handle_client(connection):
     while True:
         data = connection.recv(1024)
@@ -36,31 +62,50 @@ def handle_client(connection):
 
         command = command_parts[0].upper()
 
+        # PING
         if command == "PING":
             connection.sendall(b"+PONG\r\n")
 
+        # ECHO
         elif command == "ECHO" and len(command_parts) > 1:
             msg = command_parts[1].encode()
             response = b"$" + str(len(msg)).encode() + b"\r\n" + msg + b"\r\n"
             connection.sendall(response)
 
+        # SET with optional PX (expiry)
         elif command == "SET" and len(command_parts) >= 3:
             key = command_parts[1]
             value = command_parts[2]
-            store[key] = value
+
+            with lock:
+                store[key] = value
+                # Handle optional expiry (PX <milliseconds>)
+                if len(command_parts) >= 5 and command_parts[3].upper() == "PX":
+                    try:
+                        expiry_ms = int(command_parts[4])
+                        expiry_map[key] = int(time.time() * 1000) + expiry_ms
+                    except ValueError:
+                        pass  # ignore invalid PX values
+
             connection.sendall(b"+OK\r\n")
 
+        # GET with expiry validation
         elif command == "GET" and len(command_parts) >= 2:
             key = command_parts[1]
-            if key in store:
-                value = store[key].encode()
+
+            if is_expired(key):
+                connection.sendall(b"$-1\r\n")
+                continue
+
+            value = store.get(key)
+            if value is None:
+                connection.sendall(b"$-1\r\n")
+            else:
+                val_bytes = value.encode()
                 response = (
-                    b"$" + str(len(value)).encode() + b"\r\n" + value + b"\r\n"
+                    b"$" + str(len(val_bytes)).encode() + b"\r\n" + val_bytes + b"\r\n"
                 )
                 connection.sendall(response)
-            else:
-                # Null bulk string for missing key
-                connection.sendall(b"$-1\r\n")
 
         else:
             connection.sendall(b"-ERR unknown command\r\n")
