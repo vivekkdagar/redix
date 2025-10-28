@@ -114,7 +114,8 @@ def handle_client(conn):
 
 def main():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind(("localhost", 6379))
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("0.0.0.0", 6379))
     server.listen()
     while True:
         conn, _ = server.accept()
