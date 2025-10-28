@@ -1,228 +1,208 @@
-import asyncio
-import argparse
-import datetime
-import os
+import socket
+import sys
 import struct
-import time
+import os
 
-# -------------------- RESP PARSER --------------------
+# ---------------- CONFIG ----------------
+HOST = "0.0.0.0"
+PORT = 6379
+data = {}  # In-memory store: {key: (value, expiry)}
 
-def parse(data):
-    """Parse RESP protocol input into Python list"""
-    if not data:
-        return None
-    if data.startswith(b'*'):
-        return _parse_array(data)
-    elif data.startswith(b'+'):
-        return data[1:-2].decode()
-    elif data.startswith(b':'):
-        return int(data[1:-2])
-    elif data.startswith(b'$'):
-        return _parse_bulk_string(data)
-    return None
 
-def _parse_bulk_string(data):
-    if data.startswith(b"$-1\r\n"):
-        return None
-    try:
-        length_end = data.find(b"\r\n")
-        length = int(data[1:length_end])
-        start = length_end + 2
-        return data[start:start + length].decode()
-    except:
-        return None
+# ---------------- RDB PARSING HELPERS ----------------
+def _read_length_encoding(f):
+    """Read a length-encoded integer from RDB file"""
+    first_byte = f.read(1)
+    if not first_byte:
+        return 0
 
-def _parse_array(data):
-    parts = data.split(b'\r\n')
-    n = int(parts[0][1:])
-    res = []
-    i = 1
-    while len(res) < n and i < len(parts):
-        if parts[i].startswith(b'$'):
-            length = int(parts[i][1:])
-            res.append(parts[i + 1].decode())
-            i += 2
-        else:
-            i += 1
-    return res
+    first = first_byte[0]
+    encoding_type = (first & 0xC0) >> 6
 
-# -------------------- RESP ENCODER --------------------
+    if encoding_type == 0:  # 00 - next 6 bits is length
+        return first & 0x3F
+    elif encoding_type == 1:  # 01 - next 14 bits is length
+        next_byte = f.read(1)[0]
+        return ((first & 0x3F) << 8) | next_byte
+    elif encoding_type == 2:  # 10 - next 4 bytes is length
+        return struct.unpack(">I", f.read(4))[0]
+    else:  # 11 - special encoding
+        return first & 0x3F
 
-def encode(value):
-    if value is None:
-        return b"$-1\r\n"
-    if isinstance(value, str):
-        return f"+{value}\r\n".encode()
-    if isinstance(value, int):
-        return f":{value}\r\n".encode()
-    if isinstance(value, list):
-        out = f"*{len(value)}\r\n"
-        for v in value:
-            v_b = v.encode() if isinstance(v, str) else str(v).encode()
-            out += f"${len(v_b)}\r\n{v_b.decode()}\r\n"
-        return out.encode()
-    if value == "NULL_ARRAY":
-        return b"*-1\r\n"
-    return b"-ERR Unknown type\r\n"
 
-# -------------------- RDB LOADING --------------------
+def _read_string(f):
+    """Read a string from RDB file"""
+    length = _read_length_encoding(f)
+    if length == 0:
+        return ""
+    string_bytes = f.read(length)
+    return string_bytes.decode('utf-8', errors='ignore')
+
 
 def read_key_val_from_db(dir_path, dbfilename, data):
     """Load key-values from RDB (if exists)"""
     rdb_file_loc = os.path.join(dir_path, dbfilename)
     if not os.path.isfile(rdb_file_loc):
         return
+
     try:
         with open(rdb_file_loc, "rb") as f:
-            while b := f.read(1):
-                if b == b"\xfb":
+            # Read and verify header (REDIS + version)
+            header = f.read(9)
+            if not header.startswith(b"REDIS"):
+                return
+
+            # Read until we find the database selector (0xFE) or key-value pairs
+            while True:
+                opcode = f.read(1)
+                if not opcode:
                     break
-            _ = f.read(2)
-    except Exception:
-        pass
 
-# -------------------- CONFIG --------------------
+                # 0xFE = Database selector
+                if opcode == b"\xfe":
+                    f.read(1)  # skip db number
+                    continue
 
-def getConfig():
-    flag = argparse.ArgumentParser()
-    flag.add_argument("--dir", default=".", help="Directory for redis files")
-    flag.add_argument("--dbfilename", default="dump.rdb", help="Database filename")
-    flag.add_argument("--port", default="6379")
-    args = flag.parse_args()
-    return {
-        "dir": args.dir,
-        "dbfilename": args.dbfilename,
-        "port": args.port,
-        "host": "0.0.0.0",
-        "store": {},
-    }
+                # 0xFB = Resizedb - hash table size info
+                elif opcode == b"\xfb":
+                    _read_length_encoding(f)
+                    _read_length_encoding(f)
+                    continue
 
-# -------------------- SERVER --------------------
+                # 0xFD = Expiry time in seconds
+                elif opcode == b"\xfd":
+                    f.read(4)  # Skip 4 bytes for timestamp
+                    opcode = f.read(1)  # Read actual value type
 
-async def serveRedis():
-    config = getConfig()
-    read_key_val_from_db(config["dir"], config["dbfilename"], config["store"])
-    server = await asyncio.start_server(
-        lambda r, w: handleClient(config, r, w),
-        config["host"],
-        int(config["port"])
-    )
-    print(f"Server started on {config['host']}:{config['port']}")
-    async with server:
-        await server.serve_forever()
+                # 0xFC = Expiry time in milliseconds
+                elif opcode == b"\xfc":
+                    f.read(8)  # Skip 8 bytes for timestamp
+                    opcode = f.read(1)  # Read actual value type
 
-# -------------------- CLIENT HANDLER --------------------
+                # 0xFF = End of RDB file
+                elif opcode == b"\xff":
+                    break
 
-async def handleClient(config, reader, writer):
-    try:
-        while True:
-            data = await reader.read(1024)
-            if not data:
-                break
-            cmd = parse(data)
-            await execute(config, cmd, writer)
-            await writer.drain()
+                # 0x00 = String encoding - this is a key-value pair
+                elif opcode == b"\x00":
+                    key = _read_string(f)
+                    value = _read_string(f)
+                    if key and value:
+                        data[key] = (value, -1)  # -1 means no expiry
+
+                else:
+                    # Unknown opcode, stop
+                    break
+
     except Exception as e:
-        print("Error:", e)
-    finally:
-        writer.close()
+        print(f"Error reading RDB file: {e}")
 
-# -------------------- COMMAND EXECUTION --------------------
 
-async def execute(config, cmd, writer):
+# ---------------- RESP HELPERS ----------------
+def encode_simple(s):
+    return f"+{s}\r\n".encode()
+
+
+def encode_bulk(s):
+    if s is None:
+        return b"$-1\r\n"
+    return f"${len(s)}\r\n{s}\r\n".encode()
+
+
+def encode_array(items):
+    if items is None:
+        return b"*-1\r\n"
+    out = f"*{len(items)}\r\n"
+    for item in items:
+        out += f"${len(item)}\r\n{item}\r\n"
+    return out.encode()
+
+
+def decode_command(data):
+    """Parse RESP command"""
+    lines = data.split(b"\r\n")
+    if not lines or not lines[0].startswith(b"*"):
+        return []
+    count = int(lines[0][1:])
+    parts = []
+    i = 1
+    for _ in range(count):
+        i += 1  # skip $len
+        if i < len(lines):
+            parts.append(lines[i])
+        i += 1
+    return [p.decode() for p in parts if p]
+
+
+# ---------------- COMMAND HANDLER ----------------
+def handle_command(cmd):
     if not cmd:
-        return
-    store = config["store"]
-    op = cmd[0].lower()
-    args = cmd[1:]
+        return encode_simple("")
 
-    # --- Simple commands ---
-    if op == "ping":
-        writer.write(encode("PONG"))
-    elif op == "echo":
-        writer.write(encode(" ".join(args)))
-    elif op == "set":
-        key, val = args[0], args[1]
-        store[key] = (val, -1)
-        writer.write(encode("OK"))
-    elif op == "get":
-        val = store.get(args[0])
-        writer.write(encode(val[0] if val else None))
-    elif op == "config" and args[0].lower() == "get":
-        key = args[1]
-        if key == "dir":
-            writer.write(encode(["dir", config["dir"]]))
-        elif key == "dbfilename":
-            writer.write(encode(["dbfilename", config["dbfilename"]]))
-        else:
-            writer.write(encode([]))
+    c = cmd[0].upper()
 
-    # --- Lists ---
-    elif op == "rpush":
-        key = args[0]
-        if key not in store:
-            store[key] = []
-        store[key].extend(args[1:])
-        writer.write(encode(len(store[key])))
-    elif op == "lpush":
-        key = args[0]
-        if key not in store:
-            store[key] = []
-        store[key] = list(reversed(args[1:])) + store[key]
-        writer.write(encode(len(store[key])))
-    elif op == "lpop":
-        key = args[0]
-        if key not in store or not store[key]:
-            writer.write(encode(None))
+    if c == "PING":
+        return encode_simple("PONG")
+
+    elif c == "ECHO" and len(cmd) > 1:
+        return encode_bulk(cmd[1])
+
+    elif c == "SET" and len(cmd) >= 3:
+        data[cmd[1]] = (cmd[2], -1)
+        return encode_simple("OK")
+
+    elif c == "GET" and len(cmd) >= 2:
+        val = data.get(cmd[1])
+        return encode_bulk(val[0] if val else None)
+
+    elif c == "CONFIG" and len(cmd) >= 3:
+        param = cmd[2]
+        if param == "dir":
+            return encode_array(["dir", dir_path])
+        elif param == "dbfilename":
+            return encode_array(["dbfilename", db_filename])
         else:
-            val = store[key].pop(0)
-            writer.write(encode(val))
-    elif op == "rpop":
-        key = args[0]
-        if key not in store or not store[key]:
-            writer.write(encode(None))
+            return encode_array([])
+
+    elif c == "KEYS" and len(cmd) >= 2:
+        pattern = cmd[1]
+        if pattern == "*":
+            return encode_array(list(data.keys()))
         else:
-            val = store[key].pop()
-            writer.write(encode(val))
-    elif op == "blpop":
-        await handle_blpop(store, args, writer)
-    elif op == "keys":
-        if args and args[0] == "*":
-            writer.write(encode(list(store.keys())))
-        else:
-            writer.write(encode([]))
+            matched = [k for k in data.keys() if pattern in k]
+            return encode_array(matched)
+
     else:
-        writer.write(b"-ERR unknown command\r\n")
+        return encode_simple("")
 
-# -------------------- BLPOP HANDLER --------------------
 
-async def handle_blpop(store, args, writer):
-    """
-    BLPOP key timeout
-    Waits for an element to appear in list or returns NULL_ARRAY if timeout.
-    """
-    if len(args) != 2:
-        writer.write(b"-ERR wrong number of arguments\r\n")
-        return
-
-    key, timeout_str = args
-    try:
-        timeout = float(timeout_str)
-    except:
-        writer.write(b"-ERR invalid timeout\r\n")
-        return
-
-    end_time = time.time() + timeout
-    while time.time() < end_time:
-        if key in store and store[key]:
-            val = store[key].pop(0)
-            writer.write(encode([key, val]))
-            return
-        await asyncio.sleep(0.05)
-
-    # Timeout expired
-    writer.write(encode("NULL_ARRAY"))
-
-# -------------------- ENTRY --------------------
+# ---------------- MAIN SERVER ----------------
 if __name__ == "__main__":
-    asyncio.run(serveRedis())
+    dir_path = "."
+    db_filename = "dump.rdb"
+
+    # Parse CLI args
+    if "--dir" in sys.argv:
+        dir_path = sys.argv[sys.argv.index("--dir") + 1]
+    if "--dbfilename" in sys.argv:
+        db_filename = sys.argv[sys.argv.index("--dbfilename") + 1]
+
+    # Load data from RDB file
+    read_key_val_from_db(dir_path, db_filename, data)
+
+    # Start server
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((HOST, PORT))
+        s.listen(1)
+        print(f"Server started on {HOST}:{PORT}")
+
+        while True:
+            conn, _ = s.accept()
+            with conn:
+                data_in = conn.recv(4096)
+                if not data_in:
+                    continue
+                cmd = decode_command(data_in)
+                response = handle_command(cmd)
+                conn.sendall(response)
