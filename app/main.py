@@ -1,10 +1,11 @@
 import socket
 import threading
 
-# Store all Redis data in memory
+# In-memory data store
 data_store = {}
 
-# RESP encoding helpers
+# --- RESP ENCODING HELPERS ---
+
 def encode_bulk_string(s):
     return f"${len(s)}\r\n{s}\r\n"
 
@@ -23,19 +24,20 @@ def encode_array(arr):
         resp += encode_bulk_string(el)
     return resp
 
-# RESP parser
+def encode_null_array():
+    return "*-1\r\n"
+
+# --- RESP PARSER ---
 def parse_request(data):
     lines = data.split("\r\n")
-    if not lines or lines[0] == "":
+    if not lines or not lines[0].startswith("*"):
         return None
-
     try:
-        arg_count = int(lines[0][1:])
+        count = int(lines[0][1:])
         args = []
         i = 1
-        while i < len(lines) and len(args) < arg_count:
+        while i < len(lines) and len(args) < count:
             if lines[i].startswith("$"):
-                arg_len = int(lines[i][1:])
                 args.append(lines[i + 1])
                 i += 2
             else:
@@ -45,6 +47,7 @@ def parse_request(data):
         return None
 
 
+# --- CLIENT HANDLER ---
 def handle_client(conn):
     buffer = ""
     while True:
@@ -52,20 +55,20 @@ def handle_client(conn):
             data = conn.recv(1024)
             if not data:
                 break
-
             buffer += data.decode()
             if "\r\n" not in buffer:
                 continue
 
             request = parse_request(buffer)
+            buffer = ""
+
             if not request:
                 continue
 
-            buffer = ""  # reset buffer after processing
-
             command = request[0].upper()
 
-            # --- COMMANDS ---
+            # --- CORE COMMANDS ---
+
             if command == "PING":
                 conn.sendall(encode_simple_string("PONG").encode())
 
@@ -82,11 +85,11 @@ def handle_client(conn):
 
             elif command == "GET":
                 key = request[1]
-                value = data_store.get(key)
-                if value is None:
+                val = data_store.get(key)
+                if val is None:
                     conn.sendall(encode_null_bulk_string().encode())
                 else:
-                    conn.sendall(encode_bulk_string(value).encode())
+                    conn.sendall(encode_bulk_string(val).encode())
 
             # --- LIST COMMANDS ---
 
@@ -100,10 +103,8 @@ def handle_client(conn):
 
             elif command == "LLEN":
                 key = request[1]
-                if key not in data_store:
-                    conn.sendall(encode_integer(0).encode())
-                else:
-                    conn.sendall(encode_integer(len(data_store[key])).encode())
+                length = len(data_store.get(key, []))
+                conn.sendall(encode_integer(length).encode())
 
             elif command == "LRANGE":
                 key = request[1]
@@ -116,11 +117,23 @@ def handle_client(conn):
 
             elif command == "LPOP":
                 key = request[1]
-                if key not in data_store or len(data_store[key]) == 0:
-                    conn.sendall(encode_null_bulk_string().encode())
-                else:
-                    val = data_store[key].pop(0)
-                    conn.sendall(encode_bulk_string(val).encode())
+                lst = data_store.get(key, [])
+
+                if len(request) == 2:  # single element pop
+                    if not lst:
+                        conn.sendall(encode_null_bulk_string().encode())
+                    else:
+                        val = lst.pop(0)
+                        conn.sendall(encode_bulk_string(val).encode())
+
+                elif len(request) == 3:  # multiple elements
+                    count = int(request[2])
+                    if not lst:
+                        conn.sendall(encode_array([]).encode())
+                    else:
+                        popped = lst[:count]
+                        data_store[key] = lst[count:]
+                        conn.sendall(encode_array(popped).encode())
 
             else:
                 conn.sendall(encode_simple_string("ERR unknown command").encode())
@@ -131,6 +144,7 @@ def handle_client(conn):
     conn.close()
 
 
+# --- MAIN SERVER ---
 def main():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
