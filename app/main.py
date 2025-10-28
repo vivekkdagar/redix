@@ -1,277 +1,428 @@
+# app/main.py
+# Complete single-file Redis clone implementing:
+# PING, ECHO, SET (with EX/PX), GET, RPUSH, LPUSH, LLEN, LRANGE, LPOP (count),
+# BLPOP (blocking with timeout), basic RESP parsing/encoding.
+#
+# Uses threads for concurrency and condition variables to wake BLPOP waiters.
+
 import socket
 import threading
 import time
+from collections import deque, defaultdict
 from datetime import datetime, timedelta
 
-# ---------------- RESP TYPES ---------------- #
+HOST = "0.0.0.0"
+PORT = 6379
 
-class RESPType:
-    def encode(self):
-        raise NotImplementedError
+# -------------------------
+# In-memory storage
+# -------------------------
+_store_lock = threading.Lock()
+_strings = {}          # key -> SetEntry or raw string
+_lists = defaultdict(list)  # key -> list of str
+_ttls = {}             # key -> expiry timestamp (seconds since epoch)
+# waiters: key -> deque of (Condition, container_dict)
+_waiters = defaultdict(deque)
 
-class SimpleString(RESPType):
-    def __init__(self, value):
-        self.value = value
+# -------------------------
+# Helpers: expiry
+# -------------------------
+def _now_ts():
+    return time.time()
 
-    def encode(self):
-        return f"+{self.value}\r\n"
+def _is_expired_key(key):
+    exp = _ttls.get(key)
+    if exp is None:
+        return False
+    return _now_ts() >= exp
 
-class SimpleError(RESPType):
-    def __init__(self, value):
-        self.value = value
+def _clean_expired_key(key):
+    if key in _ttls and _now_ts() >= _ttls[key]:
+        _ttls.pop(key, None)
+        _strings.pop(key, None)
+        _lists.pop(key, None)
 
-    def encode(self):
-        return f"-{self.value}\r\n"
+# -------------------------
+# RESP encoding helpers
+# -------------------------
+def encode_simple(s: str) -> bytes:
+    return f"+{s}\r\n".encode()
 
-class Integer(RESPType):
-    def __init__(self, value):
-        self.value = int(value)
+def encode_error(s: str) -> bytes:
+    return f"-{s}\r\n".encode()
 
-    def encode(self):
-        return f":{self.value}\r\n"
+def encode_integer(n: int) -> bytes:
+    return f":{n}\r\n".encode()
 
-class BulkString(RESPType):
-    def __init__(self, value, null=False):
-        self.value = value
-        self.null = null or (value is None)
+def encode_bulk(s: str | None) -> bytes:
+    if s is None:
+        return b"$-1\r\n"
+    b = s.encode()
+    return b"$" + str(len(b)).encode() + b"\r\n" + b + b"\r\n"
 
-    def encode(self):
-        if self.null:
-            return "$-1\r\n"
-        return f"${len(self.value)}\r\n{self.value}\r\n"
+def encode_array(items: list[str]) -> bytes:
+    out = b"*" + str(len(items)).encode() + b"\r\n"
+    for it in items:
+        out += encode_bulk(it)
+    return out
 
-class Array(RESPType):
-    def __init__(self, items):
-        self.items = items or []
+def encode_null_array() -> bytes:
+    return b"*-1\r\n"
 
-    def encode(self):
-        if self.items is None:
-            return "*-1\r\n"
-        out = f"*{len(self.items)}\r\n"
-        for item in self.items:
-            out += item.encode()
-        return out
+# -------------------------
+# RESP parser: expects an Array of Bulk Strings
+# returns list[str] on success, None on incomplete/invalid
+# -------------------------
+def parse_resp_array(buf: bytes):
+    # Returns (args_list, remaining_bytes) or (None, buf) if incomplete/invalid
+    if not buf:
+        return None, buf
+    if buf[0:1] != b"*":
+        return None, buf
+    try:
+        idx = buf.index(b"\r\n")
+    except ValueError:
+        return None, buf
+    try:
+        count = int(buf[1:idx].decode())
+    except Exception:
+        return None, buf
+    pos = idx + 2
+    args = []
+    for _ in range(count):
+        if pos >= len(buf):
+            return None, buf
+        if buf[pos:pos+1] != b"$":
+            return None, buf
+        try:
+            len_end = buf.index(b"\r\n", pos)
+        except ValueError:
+            return None, buf
+        blen = int(buf[pos+1:len_end].decode())
+        start = len_end + 2
+        end = start + blen
+        if end + 2 > len(buf):
+            return None, buf
+        arg = buf[start:end].decode()
+        if buf[end:end+2] != b"\r\n":
+            return None, buf
+        args.append(arg)
+        pos = end + 2
+    remaining = buf[pos:]
+    return args, remaining
 
-
-# ---------------- SERVER CORE ---------------- #
-
-COMMANDS = {}
-
-def command(name):
-    def decorator(fn):
-        COMMANDS[name.lower()] = fn
-        return fn
-    return decorator
-
-
-# ---------------- DATA STORES ---------------- #
-
-_DATA = {}   # for SET/GET
-_LISTS = {}  # for list commands
-
-
-# ---------------- STRING COMMANDS ---------------- #
-
+# -------------------------
+# Command implementations
+# -------------------------
 class SetEntry:
-    def __init__(self, value, expiry_ms=None):
+    def __init__(self, value: str, expiry_ms: int | None = None):
         self.value = value
-        if expiry_ms is None:
-            self.expiry = None
-        else:
-            self.expiry = datetime.now() + timedelta(milliseconds=int(expiry_ms))
+        self.expiry_ts = None
+        if expiry_ms is not None:
+            self.expiry_ts = _now_ts() + (expiry_ms / 1000.0)
 
     def get(self):
-        if self.expiry and datetime.now() > self.expiry:
+        if self.expiry_ts is not None and _now_ts() >= self.expiry_ts:
             return None
         return self.value
 
+def cmd_ping(args):
+    return encode_simple("PONG")
 
-@command("set")
-def set_command(args):
-    key = args[0].decode()
-    value = args[1].decode()
+def cmd_echo(args):
+    if len(args) >= 2:
+        return encode_bulk(args[1])
+    return encode_bulk(None)
 
+def cmd_set(args):
+    # args: [key, value, ... optional PX/EX ...]
+    if len(args) < 3:
+        return encode_error("ERR wrong number of arguments for 'set' command")
+    key = args[1]
+    val = args[2]
     expiry_ms = None
-    if len(args) > 2:
-        for i in range(2, len(args) - 1):
-            if args[i].decode().lower() == "px":
-                expiry_ms = int(args[i + 1].decode())
+    # parse optional args (supports EX, PX). Case-insensitive.
+    i = 3
+    while i + 1 < len(args):
+        opt = args[i].upper()
+        if opt == "PX":
+            try:
+                expiry_ms = int(float(args[i+1]))
+            except Exception:
+                expiry_ms = None
+            i += 2
+        elif opt == "EX":
+            try:
+                expiry_ms = int(float(args[i+1])) * 1000
+            except Exception:
+                expiry_ms = None
+            i += 2
+        else:
+            i += 1
+    with _store_lock:
+        _strings[key] = SetEntry(val, expiry_ms)
+        if expiry_ms is not None:
+            _ttls[key] = _now_ts() + expiry_ms/1000.0
+        else:
+            _ttls.pop(key, None)
+    return encode_simple("OK")
 
-    _DATA[key] = SetEntry(value, expiry_ms)
-    return SimpleString("OK")
+def cmd_get(args):
+    if len(args) < 2:
+        return encode_error("ERR wrong number of arguments for 'get' command")
+    key = args[1]
+    with _store_lock:
+        # cleanup expiry if necessary
+        if key in _ttls and _now_ts() >= _ttls[key]:
+            _ttls.pop(key, None)
+            _strings.pop(key, None)
+        ent = _strings.get(key)
+        if ent is None:
+            return encode_bulk(None)
+        if isinstance(ent, SetEntry):
+            v = ent.get()
+            if v is None:
+                _strings.pop(key, None)
+                _ttls.pop(key, None)
+                return encode_bulk(None)
+            return encode_bulk(v)
+        # fallback if raw stored
+        return encode_bulk(str(ent))
 
+def cmd_rpush(args):
+    # RPUSH key val [val ...]
+    if len(args) < 3:
+        return encode_error("ERR wrong number of arguments for 'rpush' command")
+    key = args[1]
+    vals = args[2:]
+    pushed = 0
+    delivered_to_waiters = 0
+    with _store_lock:
+        # First, satisfy waiters (FIFO) with incoming values
+        while vals and _waiters.get(key):
+            waiter_cond, result_slot = _waiters[key].popleft()
+            val = vals.pop(0)
+            # deliver value to waiter
+            with waiter_cond:
+                result_slot["pair"] = (key, val)
+                waiter_cond.notify()
+            delivered_to_waiters += 1
+        # Any remaining values go to the list
+        if vals:
+            _lists[key].extend(vals)
+        pushed = len(_lists[key])
+    # return list length after operation
+    return encode_integer(pushed)
 
-@command("get")
-def get_command(args):
-    key = args[0].decode()
-    entry = _DATA.get(key)
-    if not entry:
-        return BulkString(None, null=True)
-    val = entry.get()
-    if val is None:
-        return BulkString(None, null=True)
-    return BulkString(val)
+def cmd_lpush(args):
+    if len(args) < 3:
+        return encode_error("ERR wrong number of arguments for 'lpush' command")
+    key = args[1]
+    vals = args[2:]
+    with _store_lock:
+        lst = _lists.setdefault(key, [])
+        # LPUSH semantics: leftmost becomes last in args -> push left in order
+        for v in vals:
+            lst.insert(0, v)
+        length = len(lst)
+    return encode_integer(length)
 
+def cmd_llen(args):
+    if len(args) < 2:
+        return encode_error("ERR wrong number of arguments for 'llen' command")
+    key = args[1]
+    with _store_lock:
+        length = len(_lists.get(key, []))
+    return encode_integer(length)
 
-# ---------------- LIST COMMANDS ---------------- #
-
-@command("rpush")
-def rpush_command(args):
-    key = args[0].decode()
-    values = [a.decode() for a in args[1:]]
-    lst = _LISTS.setdefault(key, [])
-    lst.extend(values)
-    return Integer(len(lst))
-
-
-@command("lpush")
-def lpush_command(args):
-    key = args[0].decode()
-    values = [a.decode() for a in args[1:]]
-    lst = _LISTS.setdefault(key, [])
-    for val in values:
-        lst.insert(0, val)
-    return Integer(len(lst))
-
-
-@command("llen")
-def llen_command(args):
-    key = args[0].decode()
-    lst = _LISTS.get(key, [])
-    return Integer(len(lst))
-
-
-@command("lpop")
-def lpop_command(args):
-    key = args[0].decode()
-    count = 1
-    if len(args) > 1:
-        count = int(args[1].decode())
-
-    lst = _LISTS.get(key)
-    if not lst:
-        return BulkString(None, null=True)
-
-    count = min(count, len(lst))
-    if count == 1:
-        return BulkString(lst.pop(0))
-    popped = [BulkString(lst.pop(0)) for _ in range(count)]
-    return Array(popped)
-
-
-@command("lrange")
-def lrange_command(args):
-    key = args[0].decode()
-    start = int(args[1].decode())
-    end = int(args[2].decode())
-
-    lst = _LISTS.get(key, [])
+def cmd_lrange(args):
+    if len(args) < 4:
+        return encode_error("ERR wrong number of arguments for 'lrange' command")
+    key = args[1]
+    start = int(float(args[2]))
+    stop = int(float(args[3]))
+    with _store_lock:
+        lst = list(_lists.get(key, []))
     n = len(lst)
+    # handle negative indices
     if start < 0:
         start = n + start
-    if end < 0:
-        end = n + end
-    end = min(end, n - 1)
+    if stop < 0:
+        stop = n + stop
     if start < 0:
         start = 0
-    if start > end or not lst:
-        return Array([])
+    if stop < 0:
+        # e.g., stop < 0 and too negative -> empty
+        return b"*0\r\n"
+    if start >= n or start > stop:
+        return b"*0\r\n"
+    stop = min(stop, n - 1)
+    slice_list = lst[start:stop + 1]
+    return encode_array(slice_list)
 
-    result = [BulkString(v) for v in lst[start:end + 1]]
-    return Array(result)
+def cmd_lpop(args):
+    # LPOP key [count]
+    if len(args) < 2:
+        return encode_error("ERR wrong number of arguments for 'lpop' command")
+    key = args[1]
+    count = 1
+    if len(args) >= 3:
+        try:
+            count = int(float(args[2]))
+        except Exception:
+            return encode_error("ERR value is not an integer or out of range")
+    with _store_lock:
+        lst = _lists.get(key, [])
+        if not lst:
+            return encode_bulk(None)
+        if count == 1:
+            val = lst.pop(0)
+            return encode_bulk(val)
+        popped = []
+        for _ in range(min(count, len(lst))):
+            popped.append(lst.pop(0))
+    # return array of popped
+    return encode_array(popped)
 
-
-@command("blpop")
-def blpop_command(args):
-    keys = [a.decode() for a in args[:-1]]
-    timeout = int(args[-1].decode())
-
-    start_time = time.time()
-    while True:
-        for key in keys:
-            lst = _LISTS.get(key, [])
+def cmd_blpop(args):
+    # BLPOP key [key ...] timeout
+    if len(args) < 3:
+        return encode_error("ERR wrong number of arguments for 'blpop' command")
+    *keys, timeout_token = args[1:]
+    # keys are strings, timeout may be float or int
+    try:
+        timeout = float(timeout_token)
+    except Exception:
+        return encode_error("ERR timeout is not a number")
+    # Immediate check for available elements
+    end_time = None if timeout == 0 else (_now_ts() + timeout)
+    # We'll poll quickly but use Condition to wait efficiently if no item exists.
+    # Approach: for this blocking call, create a Condition and append to _waiters for each key if not found.
+    # But to support multiple keys, we poll first then register waiter on each key sequentially in small loop.
+    # Simple approach: try immediate pop for each key first.
+    with _store_lock:
+        for k in keys:
+            lst = _lists.get(k, [])
             if lst:
                 val = lst.pop(0)
-                return Array([BulkString(key), BulkString(val)])
+                return encode_array([k, val])
+    # Not available immediately; if timeout==0 => block indefinitely until any key receives a value.
+    # We'll create a per-call Condition and register it with each key (so RPUSH can notify one waiter per key).
+    cond = threading.Condition()
+    result = {"pair": None}
+    # Register this waiter to all keys (the RPUSH implementation will notify only on the specific key)
+    with _store_lock:
+        for k in keys:
+            _waiters[k].append((cond, result))
+    # Now wait until notified or timeout
+    remaining = None if timeout == 0 else (end_time - _now_ts())
+    got = False
+    try:
+        with cond:
+            while True:
+                if result["pair"] is not None:
+                    got = True
+                    break
+                if timeout == 0:
+                    cond.wait(timeout=0.1)
+                else:
+                    if remaining <= 0:
+                        break
+                    start_wait = _now_ts()
+                    cond.wait(timeout=min(0.1, remaining))
+                    remaining -= (_now_ts() - start_wait)
+    finally:
+        # cleanup: remove this waiter from any waiters deque where still present
+        with _store_lock:
+            for k in keys:
+                # remove matching (cond,result) tuples if still present
+                if not _waiters.get(k):
+                    continue
+                newdq = deque()
+                while _waiters[k]:
+                    it = _waiters[k].popleft()
+                    if it[0] is cond and it[1] is result:
+                        continue
+                    newdq.append(it)
+                _waiters[k] = newdq
+    if not got or result.get("pair") is None:
+        return encode_null_array()
+    k, v = result["pair"]
+    return encode_array([k, v])
 
-        if timeout == 0:
-            time.sleep(0.05)
-            continue
+# -------------------------
+# Dispatcher
+# -------------------------
+def dispatch_command(args):
+    if not args:
+        return encode_error("ERR empty request")
+    cmd = args[0].upper()
+    if cmd == "PING":
+        return cmd_ping(args)
+    if cmd == "ECHO":
+        return cmd_echo(args)
+    if cmd == "SET":
+        return cmd_set(args)
+    if cmd == "GET":
+        return cmd_get(args)
+    if cmd == "RPUSH":
+        return cmd_rpush(args)
+    if cmd == "LPUSH":
+        return cmd_lpush(args)
+    if cmd == "LLEN":
+        return cmd_llen(args)
+    if cmd == "LRANGE":
+        return cmd_lrange(args)
+    if cmd == "LPOP":
+        return cmd_lpop(args)
+    if cmd == "BLPOP":
+        return cmd_blpop(args)
+    return encode_error("ERR unknown command")
 
-        if (time.time() - start_time) >= timeout:
-            return BulkString(None, null=True)
-
-        time.sleep(0.05)
-
-
-# ---------------- BASIC COMMANDS ---------------- #
-
-@command("ping")
-def ping_command(args):
-    return SimpleString("PONG")
-
-
-@command("echo")
-def echo_command(args):
-    return BulkString(args[0].decode())
-
-
-# ---------------- EXECUTION ---------------- #
-
-def execute(data):
-    cmd_name = data[0].decode().lower()
-    args = data[1:]
-    fn = COMMANDS.get(cmd_name)
-    if not fn:
-        return SimpleError(f"ERR unknown command {cmd_name}")
-    return fn(args)
-
-
-# ---------------- RESP PARSER ---------------- #
-
-def parse_array(data):
-    lines = data.split(b"\r\n")
-    if not lines[0].startswith(b"*"):
-        raise ValueError("Invalid array")
-    n = int(lines[0][1:])
-    items = []
-    i = 1
-    for _ in range(n):
-        assert lines[i].startswith(b"$")
-        l = int(lines[i][1:])
-        val = lines[i + 1][:l]
-        items.append(val)
-        i += 2
-    return items
-
-
-# ---------------- SOCKET SERVER ---------------- #
-
-HOST = "localhost"
-PORT = 6379
-
-def handle_client(conn, addr):
-    while True:
-        data = conn.recv(4096)
-        if not data:
-            break
+# -------------------------
+# Networking: per-client handler
+# -------------------------
+def client_thread(conn, addr):
+    # simple buffer to accumulate bytes
+    buf = b""
+    try:
+        while True:
+            data = conn.recv(4096)
+            if not data:
+                break
+            buf += data
+            # try parse as many RESP arrays as available
+            while True:
+                parsed, remaining = parse_resp_array(buf)
+                if parsed is None:
+                    break
+                buf = remaining
+                try:
+                    resp = dispatch_command(parsed)
+                except Exception as e:
+                    resp = encode_error(f"ERR {e}")
+                # send bytes
+                try:
+                    conn.sendall(resp)
+                except BrokenPipeError:
+                    break
+    finally:
         try:
-            parsed = parse_array(data)
-            resp = execute(parsed)
-            conn.sendall(resp.encode().encode())
-        except Exception as e:
-            err = SimpleError(f"ERR {str(e)}")
-            conn.sendall(err.encode().encode())
-    conn.close()
+            conn.close()
+        except Exception:
+            pass
 
-
+# -------------------------
+# Server entrypoint
+# -------------------------
 def main():
-    print("Starting Redis clone on 6379...")
-    server_socket = socket.create_server((HOST, PORT), reuse_port=True)
+    print("Logs from your program will appear here!")
+    server = socket.create_server((HOST, PORT), reuse_port=True)
+    server.listen()
     while True:
-        conn, addr = server_socket.accept()
-        threading.Thread(target=handle_client, args=(conn, addr)).start()
-
+        conn, addr = server.accept()
+        t = threading.Thread(target=client_thread, args=(conn, addr), daemon=True)
+        t.start()
 
 if __name__ == "__main__":
     main()
