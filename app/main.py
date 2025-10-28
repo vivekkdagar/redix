@@ -1,12 +1,12 @@
 import socket
 import threading
+import time
 
-# In-memory data store
+# In-memory store: key -> {"value": str, "expiry": float | None}
 store = {}
 
 
 def parse_resp(data: bytes):
-    """Minimal RESP parser to decode arrays of bulk strings."""
     parts = data.split(b"\r\n")
     items = []
     i = 0
@@ -19,9 +19,18 @@ def parse_resp(data: bytes):
     return items
 
 
-def handle_client(connection):
+def is_expired(key):
+    if key in store:
+        exp = store[key].get("expiry")
+        if exp is not None and time.time() > exp:
+            del store[key]
+            return True
+    return False
+
+
+def handle_client(conn):
     while True:
-        data = connection.recv(1024)
+        data = conn.recv(1024)
         if not data:
             break
 
@@ -31,56 +40,59 @@ def handle_client(connection):
 
         cmd = parts[0].upper()
 
-        # PING
+        # --- PING ---
         if cmd == "PING":
-            connection.sendall(b"+PONG\r\n")
+            conn.sendall(b"+PONG\r\n")
 
-        # ECHO
+        # --- ECHO ---
         elif cmd == "ECHO" and len(parts) > 1:
             msg = parts[1].encode()
-            response = b"$" + str(len(msg)).encode() + b"\r\n" + msg + b"\r\n"
-            connection.sendall(response)
+            resp = b"$" + str(len(msg)).encode() + b"\r\n" + msg + b"\r\n"
+            conn.sendall(resp)
 
-        # SET
+        # --- SET [key] [value] [EX seconds]? ---
         elif cmd == "SET" and len(parts) >= 3:
             key, value = parts[1], parts[2]
-            store[key] = value
-            connection.sendall(b"+OK\r\n")
+            expiry = None
 
-        # GET
+            # Handle optional EX argument
+            if len(parts) >= 5 and parts[3].upper() == "EX":
+                try:
+                    expiry = time.time() + int(parts[4])
+                except ValueError:
+                    expiry = None
+
+            store[key] = {"value": value, "expiry": expiry}
+            conn.sendall(b"+OK\r\n")
+
+        # --- GET [key] ---
         elif cmd == "GET" and len(parts) >= 2:
             key = parts[1]
-            if key in store and not isinstance(store[key], list):
-                val = store[key].encode()
-                response = (
-                    b"$" + str(len(val)).encode() + b"\r\n" + val + b"\r\n"
-                )
-                connection.sendall(response)
+            if key not in store or is_expired(key):
+                conn.sendall(b"$-1\r\n")
             else:
-                connection.sendall(b"$-1\r\n")
+                val = store[key]["value"].encode()
+                resp = b"$" + str(len(val)).encode() + b"\r\n" + val + b"\r\n"
+                conn.sendall(resp)
 
-        # RPUSH (Create or append element)
+        # --- RPUSH (Lists) ---
         elif cmd == "RPUSH" and len(parts) == 3:
             key, value = parts[1], parts[2]
             if key not in store:
-                # create a new list
-                store[key] = [value]
+                store[key] = {"value": [value], "expiry": None}
             else:
-                # append to existing list
-                if isinstance(store[key], list):
-                    store[key].append(value)
+                current = store[key]["value"]
+                if isinstance(current, list):
+                    current.append(value)
                 else:
-                    # overwrite non-list type for simplicity in this stage
-                    store[key] = [value]
-            # return list length
-            length = len(store[key])
-            response = f":{length}\r\n".encode()
-            connection.sendall(response)
+                    store[key]["value"] = [value]
+            length = len(store[key]["value"])
+            conn.sendall(f":{length}\r\n".encode())
 
         else:
-            connection.sendall(b"-ERR unknown command\r\n")
+            conn.sendall(b"-ERR unknown command\r\n")
 
-    connection.close()
+    conn.close()
 
 
 def main():
