@@ -1,158 +1,171 @@
-import socket
-import threading
-import time
+import socket  # noqa: F401
+import threading  # noqa: F401
+import time  # noqa: F401
 
-data_store = {}
-list_blocked_clients = {}  # key -> list of (conn, start_time, timeout)
-
-def encode_simple_string(s): return f"+{s}\r\n".encode()
-def encode_error(s): return f"-{s}\r\n".encode()
-def encode_integer(n): return f":{n}\r\n".encode()
-def encode_bulk_string(s):
-    if s is None: return b"$-1\r\n"
-    return f"${len(s)}\r\n{s}\r\n".encode()
-def encode_array(arr):
-    if arr is None: return b"*-1\r\n"
-    return f"*{len(arr)}\r\n".encode() + b"".join(encode_bulk_string(x) for x in arr)
-
-def parse_command(data):
-    parts = data.split(b"\r\n")
-    if not parts or not parts[0].startswith(b"*"): return []
-    arr_len = int(parts[0][1:])
-    args = []
-    idx = 2
-    for _ in range(arr_len):
-        args.append(parts[idx - 1 + 1].decode())
-        idx += 2
-    return args
-
-def handle_client(conn):
-    buffer = b""
-    while True:
-        chunk = conn.recv(1024)
-        if not chunk: break
-        buffer += chunk
-        if b"\r\n" not in buffer: continue
-        if not buffer.startswith(b"*"): continue
-        try:
-            args = parse_command(buffer)
-        except Exception:
-            conn.sendall(encode_error("ERR parse error"))
-            buffer = b""
-            continue
-        buffer = b""
-        if not args: continue
-
-        cmd = args[0].upper()
-
-        # ---------------- PING / ECHO / GET / SET ----------------
-        if cmd == "PING":
-            conn.sendall(encode_simple_string("PONG") if len(args) == 1 else encode_bulk_string(args[1]))
-
-        elif cmd == "ECHO":
-            conn.sendall(encode_bulk_string(args[1]))
-
-        elif cmd == "SET":
-            key, value = args[1], args[2]
-            data_store[key] = value
-            conn.sendall(encode_simple_string("OK"))
-
-        elif cmd == "GET":
-            conn.sendall(encode_bulk_string(data_store.get(args[1])))
-
-        # ---------------- LIST COMMANDS ----------------
-        elif cmd in ["LPUSH", "RPUSH"]:
-            key, values = args[1], args[2:]
-            lst = data_store.get(key, [])
-            if not isinstance(lst, list): lst = []
-            if cmd == "LPUSH":
-                for v in values: lst.insert(0, v)
-            else:
-                for v in values: lst.append(v)
-            data_store[key] = lst
-            conn.sendall(encode_integer(len(lst)))
-
-            # wake any blocked BLPOP clients
-            if key in list_blocked_clients and lst:
-                blocked = list_blocked_clients.pop(key)
-                val = lst.pop(0)
-                data_store[key] = lst
-                for c, _, _ in blocked:
-                    try: c.sendall(encode_array([key, val]))
-                    except: pass
-
-        elif cmd in ["LPOP", "RPOP"]:
-            key = args[1]
-            lst = data_store.get(key, [])
-            if not lst:
-                conn.sendall(encode_bulk_string(None))
-            else:
-                val = lst.pop(0) if cmd == "LPOP" else lst.pop()
-                data_store[key] = lst
-                conn.sendall(encode_bulk_string(val))
-
-        elif cmd == "LRANGE":
-            key, start, end = args[1], int(args[2]), int(args[3])
-            lst = data_store.get(key, [])
-            if not isinstance(lst, list): lst = []
-            if end < 0: end = len(lst) + end
-            end = min(end, len(lst) - 1)
-            sub = lst[start:end + 1] if lst else []
-            conn.sendall(encode_array(sub))
-
-        # ---------------- BLPOP ----------------
-        elif cmd == "BLPOP":
-            keys = args[1:-1]
-            try:
-                timeout = float(args[-1])
-            except ValueError:
-                timeout = 0.0  # default if malformed
-
-            found = False
-            for key in keys:
-                lst = data_store.get(key, [])
-                if lst:
-                    val = lst.pop(0)
-                    data_store[key] = lst
-                    conn.sendall(encode_array([key, val]))
-                    found = True
-                    break
-
-            if not found:
-                for key in keys:
-                    list_blocked_clients.setdefault(key, []).append((conn, time.time(), timeout))
-
-        else:
-            conn.sendall(encode_error(f"ERR unknown command '{cmd}'"))
-
-
-def unblock_thread():
-    while True:
-        time.sleep(0.05)
-        now = time.time()
-        for key, waiters in list(list_blocked_clients.items()):
-            still_waiting = []
-            for conn, start, timeout in waiters:
-                if now - start >= timeout:
-                    try:
-                        conn.sendall(encode_array(None))
-                    except: pass
-                else:
-                    still_waiting.append((conn, start, timeout))
-            if still_waiting:
-                list_blocked_clients[key] = still_waiting
-            else:
-                list_blocked_clients.pop(key, None)
 
 def main():
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("localhost", 6379))
-    srv.listen(5)
-    threading.Thread(target=unblock_thread, daemon=True).start()
+    # You can use print statements as follows for debugging, they'll be visible when running tests.
+    print("Logs from your program will appear here!")
+
+    redis_data = {}
+    redis_ttl = {}
+    server_socket = socket.create_server(("localhost", 6379), reuse_port=True)
+    server_socket.listen()
+
+    def handle_client(conn: socket.socket):
+        try:
+            while True:
+                cmd = conn.recv(1024)
+                if not cmd:
+                    break
+                if b"PING" in cmd:
+                    conn.send(create_resp_simple_string("PONG"))
+                elif b"ECHO" in cmd:
+                    message = cmd.split(b"\r\n")[-2]
+                    conn.send(create_resp_bulk_string(message))
+                elif b"SET" in cmd:
+                    redis_data[cmd.split(b"\r\n")[4]] = cmd.split(b"\r\n")[6]
+                    if len(cmd.split(b"\r\n")) > 8:
+                        now = time.time()
+                        if cmd.split(b"\r\n")[8] == b"PX":
+                            expiry = now + int(cmd.split(b"\r\n")[10]) / 1000
+                            redis_ttl[cmd.split(b"\r\n")[4]] = expiry
+                        elif cmd.split(b"\r\n")[8] == b"EX":
+                            expiry = now + int(cmd.split(b"\r\n")[10])
+                            redis_ttl[cmd.split(b"\r\n")[4]] = expiry
+                    conn.send(create_resp_simple_string("OK"))
+                elif b"GET" in cmd:
+                    key = cmd.split(b"\r\n")[-2]
+                    if key not in redis_data:
+                        conn.send(create_resp_bulk_string(b""))
+                        continue
+                    if key in redis_ttl:
+                        if time.time() > redis_ttl[key]:
+                            del redis_data[key]
+                            del redis_ttl[key]
+                    value = redis_data.get(key, b"")
+                    conn.send(create_resp_bulk_string(value))
+                elif b"RPUSH" in cmd:
+                    key = cmd.split(b"\r\n")[4]
+                    if len(cmd.split(b"\r\n")) > 7:
+                        values = []
+                        for i in range(6, len(cmd.split(b"\r\n")) - 1, 2):
+                            values.append(cmd.split(b"\r\n")[i])
+                        if key not in redis_data:
+                            redis_data[key] = []
+                        redis_data[key].extend(values)
+                        conn.send(create_resp_integer(len(redis_data[key])))
+                        continue
+                    value = cmd.split(b"\r\n")[6]
+                    if key not in redis_data:
+                        redis_data[key] = []
+                    redis_data[key].append(value)
+                    conn.send(create_resp_integer(len(redis_data[key])))
+                elif b"LRANGE" in cmd:
+                    key = cmd.split(b"\r\n")[4]
+                    start = int(cmd.split(b"\r\n")[6])
+                    end = int(cmd.split(b"\r\n")[8])
+                    if (
+                        key not in redis_data
+                        or start >= len(redis_data[key])
+                        or (end > 0 and start > end)
+                    ):
+                        conn.send(b"*0\r\n")
+                        continue
+                    lst = redis_data[key]
+                    if end == -1:
+                        end = len(lst) - 1
+                    else:
+                        end = min(end, len(lst) - 1)
+                    result = lst[start : end + 1]
+                    resp = b"*" + str(len(result)).encode() + b"\r\n"
+                    for item in result:
+                        resp += create_resp_bulk_string(item)
+                    conn.send(resp)
+                elif b"LPUSH" in cmd:
+                    key = cmd.split(b"\r\n")[4]
+                    if len(cmd.split(b"\r\n")) > 7:
+                        values = []
+                        for i in range(6, len(cmd.split(b"\r\n")) - 1, 2):
+                            values.append(cmd.split(b"\r\n")[i])
+                        if key not in redis_data:
+                            redis_data[key] = []
+                        redis_data[key] = values[::-1] + redis_data[key]
+                        conn.send(create_resp_integer(len(redis_data[key])))
+                        continue
+                    value = cmd.split(b"\r\n")[6]
+                    if key not in redis_data:
+                        redis_data[key] = []
+                    redis_data[key].insert(0, value)
+                    conn.send(create_resp_integer(len(redis_data[key])))
+                elif b"LLEN" in cmd:
+                    key = cmd.split(b"\r\n")[-2]
+                    length = len(redis_data.get(key, []))
+                    conn.send(create_resp_integer(length))
+                elif b"BLPOP" in cmd:
+                    key = cmd.split(b"\r\n")[4]
+                    if len(cmd.split(b"\r\n")) > 6:
+                        timeout = float(cmd.split(b"\r\n")[6])
+                    else:
+                        timeout = 0
+                    end_time = time.time() + timeout
+                    flag = False
+                    lock = threading.Lock()
+                    with lock:
+                        while time.time() < end_time or timeout == 0:
+                            if key in redis_data and len(redis_data[key]) > 0:
+                                value = redis_data[key].pop(0)
+                                conn.send(create_resp_array([key, value], 2))
+                                flag = True
+                                break
+                            time.sleep(0.1)
+                    if not flag:
+                        conn.send(create_resp_array([], -1))
+                elif b"LPOP" in cmd:
+                    key = cmd.split(b"\r\n")[4]
+                    if key not in redis_data or len(redis_data[key]) == 0:
+                        conn.send(create_resp_bulk_string(b""))
+                        continue
+                    if len(cmd.split(b"\r\n")) > 6:
+                        count = int(cmd.split(b"\r\n")[6])
+                        count = min(count, len(redis_data[key]))
+                        values = []
+                        for _ in range(count):
+                            value = redis_data[key].pop(0)
+                            values.append(value)
+                        conn.send(create_resp_array(values, count))
+                        continue
+                    value = redis_data[key].pop(0)
+                    conn.send(create_resp_bulk_string(value))
+                else:
+                    break
+        finally:
+            conn.close()
+
+    def create_resp_array(items: list, count: int) -> bytes:
+        if count == -1:
+            return b"*-1\r\n"
+        resp = b"*" + str(count).encode() + b"\r\n"
+        for item in items:
+            resp += create_resp_bulk_string(item)
+        return resp
+
+    def create_resp_simple_string(message: str) -> bytes:
+        return b"+" + message.encode() + b"\r\n"
+
+    def create_resp_integer(number: int) -> bytes:
+        return b":" + str(number).encode() + b"\r\n"
+
+    def create_resp_bulk_string(message: bytes) -> bytes:
+        if not message:
+            return b"$-1\r\n"
+        return b"$" + str(len(message)).encode() + b"\r\n" + message + b"\r\n"
+
     while True:
-        conn, _ = srv.accept()
-        threading.Thread(target=handle_client, args=(conn,), daemon=True).start()
+        connection, _ = server_socket.accept()  # wait for client
+        t = threading.Thread(target=handle_client, args=(connection,), daemon=True)
+        t.start()
+
 
 if __name__ == "__main__":
     main()
