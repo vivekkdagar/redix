@@ -119,7 +119,7 @@ def handle_client(conn):
             conn.sendall(encode_resp(len(lst)))
 
         # ---------------------------
-        # LRANGE (positive indexes only)
+        # LRANGE (with negative indexes)
         # ---------------------------
         elif command == b"LRANGE":
             key = parts[4].decode()
@@ -131,15 +131,24 @@ def handle_client(conn):
                 continue
 
             lst = db[key]["value"]
-
             if not isinstance(lst, list):
                 conn.sendall(encode_resp([]))
                 continue
 
-            if start >= len(lst) or start > stop:
+            # Convert negative indexes
+            n = len(lst)
+            if start < 0:
+                start = n + start
+            if stop < 0:
+                stop = n + stop
+
+            # Clamp bounds
+            start = max(start, 0)
+            stop = min(stop, n - 1)
+
+            if start > stop or start >= n:
                 result = []
             else:
-                stop = min(stop, len(lst) - 1)
                 result = lst[start : stop + 1]
 
             conn.sendall(encode_resp(result))
