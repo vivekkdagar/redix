@@ -1,105 +1,153 @@
 import socket
 import threading
-import time
+from datetime import datetime, timedelta
+from dataclasses import dataclass
+from typing import Any, Optional
 
-# In-memory store: key -> {"value": str, "expiry": float | None}
-store = {}
+
+# -------------------------------
+# Data Classes and Storage Layer
+# -------------------------------
+
+@dataclass
+class Value:
+    item: Any
+    expire: Optional[datetime] = None
 
 
-def parse_resp(data: bytes):
+class Storage:
+    def __init__(self):
+        self.data: dict[str, Value] = {}
+
+    def set(self, key: str, value: Value) -> None:
+        self.data[key] = value
+
+    def get(self, key: str) -> Optional[str]:
+        if key not in self.data:
+            return None
+
+        val = self.data[key]
+
+        # Check expiry
+        if val.expire is not None and datetime.now() > val.expire:
+            del self.data[key]
+            return None
+
+        return val.item
+
+
+# -------------------------------
+# RESP Protocol Helpers
+# -------------------------------
+
+def parse_resp(data: bytes) -> list[str]:
+    """Parse a RESP array like *3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n"""
     parts = data.split(b"\r\n")
     items = []
     i = 0
     while i < len(parts):
-        if parts[i].startswith(b"$"):
+        if not parts[i]:
             i += 1
-            if i < len(parts) and parts[i] != b"":
-                items.append(parts[i].decode())
-        i += 1
-    return items
-
-
-def is_expired(key):
-    if key in store:
-        exp = store[key].get("expiry")
-        if exp is not None and time.time() > exp:
-            del store[key]
-            return True
-    return False
-
-
-def handle_client(conn):
-    while True:
-        data = conn.recv(1024)
-        if not data:
-            break
-
-        parts = parse_resp(data)
-        if not parts:
             continue
-
-        cmd = parts[0].upper()
-
-        # --- PING ---
-        if cmd == "PING":
-            conn.sendall(b"+PONG\r\n")
-
-        # --- ECHO ---
-        elif cmd == "ECHO" and len(parts) > 1:
-            msg = parts[1].encode()
-            resp = b"$" + str(len(msg)).encode() + b"\r\n" + msg + b"\r\n"
-            conn.sendall(resp)
-
-        # --- SET [key] [value] [EX seconds]? ---
-        elif cmd == "SET" and len(parts) >= 3:
-            key, value = parts[1], parts[2]
-            expiry = None
-
-            # Handle optional EX argument
-            if len(parts) >= 5 and parts[3].upper() == "EX":
-                try:
-                    expiry = time.time() + int(parts[4])
-                except ValueError:
-                    expiry = None
-
-            store[key] = {"value": value, "expiry": expiry}
-            conn.sendall(b"+OK\r\n")
-
-        # --- GET [key] ---
-        elif cmd == "GET" and len(parts) >= 2:
-            key = parts[1]
-            if key not in store or is_expired(key):
-                conn.sendall(b"$-1\r\n")
-            else:
-                val = store[key]["value"].encode()
-                resp = b"$" + str(len(val)).encode() + b"\r\n" + val + b"\r\n"
-                conn.sendall(resp)
-
-        # --- RPUSH (Lists) ---
-        elif cmd == "RPUSH" and len(parts) == 3:
-            key, value = parts[1], parts[2]
-            if key not in store:
-                store[key] = {"value": [value], "expiry": None}
-            else:
-                current = store[key]["value"]
-                if isinstance(current, list):
-                    current.append(value)
-                else:
-                    store[key]["value"] = [value]
-            length = len(store[key]["value"])
-            conn.sendall(f":{length}\r\n".encode())
-
+        if parts[i].startswith(b"$"):
+            # Next line is the actual data
+            items.append(parts[i + 1].decode())
+            i += 2
         else:
-            conn.sendall(b"-ERR unknown command\r\n")
+            i += 1
+    return [x.upper() if idx == 0 else x for idx, x in enumerate(items)]
 
-    conn.close()
+
+def encode_bulk_string(value: Optional[str]) -> bytes:
+    if value is None:
+        return b"$-1\r\n"
+    return f"${len(value)}\r\n{value}\r\n".encode()
+
+
+def encode_simple_string(msg: str) -> bytes:
+    return f"+{msg}\r\n".encode()
+
+
+def encode_integer(num: int) -> bytes:
+    return f":{num}\r\n".encode()
+
+
+# -------------------------------
+# Command Handling
+# -------------------------------
+
+storage = Storage()
+
+
+def handle_command(command: str, args: list[str]) -> bytes:
+    if command == "PING":
+        return encode_simple_string("PONG")
+
+    elif command == "ECHO":
+        return encode_bulk_string(args[0] if args else "")
+
+    elif command == "SET":
+        key = args[0]
+        value = args[1]
+        expire_time = None
+
+        # Optional EX / PX
+        if len(args) >= 4:
+            option = args[2].upper()
+            exp_value = int(args[3])
+            if option == "EX":
+                expire_time = datetime.now() + timedelta(seconds=exp_value)
+            elif option == "PX":
+                expire_time = datetime.now() + timedelta(milliseconds=exp_value)
+
+        storage.set(key, Value(value, expire_time))
+        return encode_simple_string("OK")
+
+    elif command == "GET":
+        key = args[0]
+        value = storage.get(key)
+        return encode_bulk_string(value)
+
+    else:
+        return encode_simple_string("ERR unknown command")
+
+
+# -------------------------------
+# Networking
+# -------------------------------
+
+def handle_client(conn: socket.socket):
+    try:
+        while True:
+            data = conn.recv(1024)
+            if not data:
+                break
+
+            parts = parse_resp(data)
+            if not parts:
+                continue
+
+            command = parts[0]
+            args = parts[1:]
+            response = handle_command(command, args)
+            conn.sendall(response)
+
+    except ConnectionResetError:
+        pass
+    finally:
+        conn.close()
 
 
 def main():
-    server = socket.create_server(("localhost", 6379), reuse_port=True)
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("localhost", 6379))
+    server.listen(5)
+    print("Redis clone running on port 6379...")
+
     while True:
         conn, _ = server.accept()
-        threading.Thread(target=handle_client, args=(conn,)).start()
+        threading.Thread(target=handle_client, args=(conn,), daemon=True).start()
 
 
 if __name__ == "__main__":
