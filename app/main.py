@@ -1,192 +1,171 @@
-import asyncio
-from enum import Enum
-from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Any, Optional
+import time
+import socket  # noqa: F401
+import threading
 
 
-# ==========================
-# ENUM: Command Types
-# ==========================
-class Command(Enum):
-    ECHO = 1
-    SET = 2
-    GET = 3
-    PING = 4
-    RPUSH = 5
-
-
-# ==========================
-# PARSER
-# ==========================
-class Parser:
-    def parse_command(self, payload: bytes) -> tuple[Command, ...]:
-        message = payload.decode()
-        upper = message.upper()
-
-        if "ECHO" in upper:
-            return Command.ECHO, *self._parse(message)
-        elif "SET" in upper:
-            return Command.SET, *self._parse(message)
-        elif "GET" in upper:
-            return Command.GET, *self._parse(message)
-        elif "PING" in upper:
-            return Command.PING, *("PING",)
-        elif "RPUSH" in upper:
-            return Command.RPUSH, *self._parse(message)
-        else:
-            raise RuntimeError("Unknown command")
-
-    @staticmethod
-    def _parse(message: str) -> list[str]:
-        parts = message.split("\r\n")
-        result = []
-        i = 0
-        while i < len(parts):
-            if parts[i].startswith("$"):
-                i += 1
-                if i < len(parts) and parts[i] != "":
-                    result.append(parts[i])
-            i += 1
-        return result
-
-
-parser = Parser()
-
-
-# ==========================
-# FORMATTER
-# ==========================
-class Formatter:
-    @staticmethod
-    def format_echo_expression(args: tuple[str, ...]) -> bytes:
-        msg = args[1].encode()
-        return b"$" + str(len(msg)).encode() + b"\r\n" + msg + b"\r\n"
-
-    @staticmethod
-    def format_ok_expression() -> bytes:
-        return b"+OK\r\n"
-
-    @staticmethod
-    def format_get_response(value: Any) -> bytes:
-        if value is None:
-            return b"$-1\r\n"
-        if isinstance(value, Value):
-            val = str(value.item).encode()
-        else:
-            val = str(value).encode()
-        return b"$" + str(len(val)).encode() + b"\r\n" + val + b"\r\n"
-
-    @staticmethod
-    def format_rpush_response(values: list) -> bytes:
-        # RESP integer
-        return f":{len(values)}\r\n".encode()
-
-
-formatter = Formatter()
-
-
-# ==========================
-# STORAGE
-# ==========================
-@dataclass
-class Value:
-    item: Any
-    expire: Optional[datetime] = None
-
-
-class Storage:
+class Handler:
     def __init__(self):
-        self.data: dict[Any, Any] = {}
+        # Store value and expiry (None or timestamp in seconds)
+        self.dictionary = dict()
 
-    def set(self, key: str, value: Value) -> None:
-        self.data[key] = value
-
-    def rpush(self, key: str, value: Value) -> list[Value]:
-        if key in self.data and isinstance(self.data[key], list):
-            self.data[key].append(value)
-        elif key not in self.data:
-            self.data[key] = [value]
-        else:
-            raise RuntimeError(f"Key {key} exists and is not a list")
-        return self.data[key]
-
-    def get(self, key: str) -> Any:
-        if key not in self.data:
-            return None
-        val = self.data[key]
-        if isinstance(val, Value) and val.expire and val.expire <= datetime.now():
-            return None
-        return val
-
-
-storage = Storage()
-
-
-# ==========================
-# PROCESSOR
-# ==========================
-async def process_command(command: tuple[Command, str, ...], writer: Any) -> None:
-    """Process a single Redis-like command and send the result."""
-
-    if command[0] == Command.ECHO:
-        writer.write(formatter.format_echo_expression(command[1:]))
-
-    elif command[0] == Command.SET:
-        req = command[1:]
-        key, value = req[1], req[2]
-        if len(req) > 3:
-            expiration = (
-                datetime.now() + timedelta(seconds=int(req[4]))
-                if req[3].upper() == "EX"
-                else datetime.now() + timedelta(milliseconds=int(req[4]))
-            )
-        else:
-            expiration = None
-        storage.set(key, Value(value, expiration))
-        writer.write(formatter.format_ok_expression())
-
-    elif command[0] == Command.GET:
-        key = command[2]
-        val = storage.get(key)
-        writer.write(formatter.format_get_response(val))
-
-    elif command[0] == Command.PING:
-        writer.write(b"+PONG\r\n")
-
-    elif command[0] == Command.RPUSH:
-        key = command[2]
-        val = command[3]
-        result = storage.rpush(key, Value(val))
-        writer.write(formatter.format_rpush_response(result))
-
-    await writer.drain()
-
-
-# ==========================
-# ASYNC SERVER
-# ==========================
-async def handle_client(reader, writer):
-    try:
+    def handle(self, connection):
         while True:
-            data = await reader.read(1024)
-            if not data:
+            data = connection.recv(1024)
+            if data is None:
                 break
-            cmd = parser.parse_command(data)
-            await process_command(cmd, writer)
-    except Exception as e:
-        print(f"Error: {e}")
-    finally:
-        writer.close()
-        await writer.wait_closed()
+            if data.startswith(b"*1\r\n$4\r\nPING"):
+                self.handle_ping(connection)
+            elif data.startswith(b"*2\r\n$4\r\nECHO"):
+                self.handle_echo(connection, data)
+            elif data.startswith(b"*3\r\n$3\r\nSET") or data.startswith(
+                b"*5\r\n$3\r\nSET"
+            ):
+                self.handle_set(connection, data)
+            elif data.startswith(b"*2\r\n$3\r\nGET"):
+                self.handle_get(connection, data)
+            elif b"\r\n$5\r\nRPUSH\r\n" in data:
+                self.handle_rpush(connection, data)
+            else:
+                connection.sendall(b"-ERR unknown command\r\n")
+        connection.close()
+
+    def handle_ping(self, connection):
+        connection.sendall(b"+PONG\r\n")
+
+    def handle_echo(self, connection, data):
+        parts = data.split(b"\r\n")
+        try:
+            dollar_indices = [
+                i for i, part in enumerate(parts) if part.startswith(b"$")
+            ]
+            if len(dollar_indices) >= 2:
+                arg_index = dollar_indices[1] + 1
+                message = parts[arg_index]
+                response = (
+                    b"$" + str(len(message)).encode() + b"\r\n" + message + b"\r\n"
+                )
+                connection.sendall(response)
+            else:
+                connection.sendall(
+                    b"-ERR wrong number of arguments for 'echo' command\r\n"
+                )
+        except Exception:
+            connection.sendall(b"-ERR wrong number of arguments for 'echo' command\r\n")
+
+    def handle_set(self, connection, data):
+        parts = data.split(b"\r\n")
+        try:
+            dollar_indices = [
+                i for i, part in enumerate(parts) if part.startswith(b"$")
+            ]
+            if len(dollar_indices) >= 3:
+                key_index = dollar_indices[1] + 1
+                value_index = dollar_indices[2] + 1
+                key = parts[key_index]
+                value = parts[value_index]
+                expiry = None
+                # Check for PX argument
+                if len(dollar_indices) >= 5:
+                    px_index = dollar_indices[3] + 1
+                    px_value_index = dollar_indices[4] + 1
+                    if parts[px_index].upper() == b"PX":
+                        try:
+                            ms = int(parts[px_value_index])
+                            expiry = time.time() + ms / 1000.0
+                        except Exception:
+                            connection.sendall(b"-ERR PX value is not an integer\r\n")
+                            return
+                # Store value and expiry (None if not set)
+                self.dictionary[key] = (value, expiry)
+                connection.sendall(b"+OK\r\n")
+            else:
+                connection.sendall(
+                    b"-ERR wrong number of arguments for 'set' command\r\n"
+                )
+        except Exception:
+            connection.sendall(b"-ERR wrong number of arguments for 'set' command\r\n")
+
+    def handle_get(self, connection, data):
+        parts = data.split(b"\r\n")
+        try:
+            dollar_indices = [
+                i for i, part in enumerate(parts) if part.startswith(b"$")
+            ]
+            if len(dollar_indices) >= 2:
+                key_index = dollar_indices[1] + 1
+                key = parts[key_index]
+                entry = self.dictionary.get(key, None)
+                if entry is None:
+                    connection.sendall(b"$-1\r\n")
+                    return
+                value, expiry = entry
+                # Check expiry
+                if expiry is not None and time.time() > expiry:
+                    # Key expired, remove it
+                    del self.dictionary[key]
+                    connection.sendall(b"$-1\r\n")
+                    return
+                response = b"$" + str(len(value)).encode() + b"\r\n" + value + b"\r\n"
+                connection.sendall(response)
+            else:
+                connection.sendall(
+                    b"-ERR wrong number of arguments for 'get' command\r\n"
+                )
+        except Exception:
+            connection.sendall(b"-ERR wrong number of arguments for 'get' command\r\n")
+
+    def handle_rpush(self, connection, data):
+        parts = data.split(b"\r\n")
+        try:
+            dollar_indices = [
+                i for i, part in enumerate(parts) if part.startswith(b"$")
+            ]
+            if len(dollar_indices) < 3:
+                connection.sendall(
+                    b"-ERR wrong number of arguments for 'rpush' command\r\n"
+                )
+                return
+            key_index = dollar_indices[1] + 1
+            key = parts[key_index]
+            # All remaining $ indices are values
+            values = []
+            for i in range(2, len(dollar_indices)):
+                value_index = dollar_indices[i] + 1
+                values.append(parts[value_index])
+            # Store or update the list in the dictionary
+            entry = self.dictionary.get(key)
+            if entry is not None:
+                current_value, expiry = entry
+                if not isinstance(current_value, list):
+                    connection.sendall(b"-ERR wrong type\r\n")
+                    return
+                current_value.extend(values)
+                lst = current_value
+            else:
+                lst = values
+                expiry = None
+            self.dictionary[key] = (lst, expiry)
+            # Respond with the length of the list
+        response = b":" + str(len(lst)).encode() + b"\r\n"
+        connection.sendall(response)
+
+    except Exception:
+    connection.sendall(b"-ERR error processing 'rpush' command\r\n")
 
 
-async def main():
+def main():
+    # You can use print statements as follows for debugging, they'll be visible when running tests.
     print("Logs from your program will appear here!")
-    server = await asyncio.start_server(handle_client, "localhost", 6379)
-    async with server:
-        await server.serve_forever()
+
+    # Uncomment this to pass the first stage
+    #
+    server_socket = socket.create_server(("localhost", 6379), reuse_port=True)
+    handler = Handler()
+    while True:
+        connection, _ = server_socket.accept()  # wait for client
+        client_thread = threading.Thread(target=handler.handle, args=(connection,))
+        client_thread.start()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
