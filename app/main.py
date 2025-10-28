@@ -134,7 +134,8 @@ def unblock_thread():
             still_waiting = []
             for conn, start, timeout in waiters:
                 if now - start >= timeout:
-                    try: conn.sendall(encode_bulk_string(None))
+                    try:
+                        conn.sendall(encode_array(None))
                     except: pass
                 else:
                     still_waiting.append((conn, start, timeout))
