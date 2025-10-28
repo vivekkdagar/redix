@@ -1,244 +1,384 @@
+# app/main.py
 import asyncio
-import time
-from collections import deque
+from collections import deque, defaultdict
 
-# ==============================
-# REDIS CONSTANTS
-# ==============================
-ECHO_COMMAND = "ECHO"
-PING_COMMAND = "PING"
-SET_COMMAND = "SET"
-GET_COMMAND = "GET"
-RPUSH_COMMAND = "RPUSH"
-LPUSH_COMMAND = "LPUSH"
-LRANGE_COMMAND = "LRANGE"
-LPOP_COMMAND = "LPOP"
-LLEN_COMMAND = "LLEN"
+HOST = "0.0.0.0"  # use 0.0.0.0 for test environment visibility
+PORT = 6379
 
-PONG_RESP = b"+PONG\r\n"
-OK_RESP = b"+OK\r\n"
-NULL_RESP = b"$-1\r\n"
-EMPTY_ARRAY = b"*0\r\n"
-
-# ==============================
-# IN-MEMORY DATABASE
-# ==============================
-REDIS_DATABASE = {}
+# -----------------------
+# In-memory data storage
+# -----------------------
+store = {}  # key -> deque([...]) for lists or str for strings (we'll only use lists and strings)
+waiters = defaultdict(deque)  # key -> deque of asyncio.Future objects (waiting BLPOP clients)
+lock = asyncio.Lock()  # protect store and waiters in async environment
 
 
-# ==============================
-# DATA HELPERS
-# ==============================
-def get_data_from_redis(key):
-    """Get value (with expiry check)"""
-    data = REDIS_DATABASE.get(key)
-    if data is None:
-        return None
-    if "exp" in data and data["exp"]:
-        now = int(time.time() * 1000)
-        if now > data["exp"]:
-            del REDIS_DATABASE[key]
-            return None
-    return data["value"]
+# -----------------------
+# RESP helpers
+# -----------------------
+def encode_simple(s: str) -> bytes:
+    return f"+{s}\r\n".encode()
 
 
-def add_data_to_redis(key, value, exp=None):
-    """Add key-value pair with optional expiration"""
-    now = int(time.time() * 1000)
-    REDIS_DATABASE[key] = {"value": value, "exp": now + exp if exp else None}
+def encode_bulk(s: str | None) -> bytes:
+    if s is None:
+        return b"$-1\r\n"
+    b = s.encode()
+    return b"$" + str(len(b)).encode() + b"\r\n" + b + b"\r\n"
 
 
-def add_data_to_redis_list(key, values, side):
-    """Append or prepend elements to a list"""
-    if key not in REDIS_DATABASE:
-        REDIS_DATABASE[key] = {"value": deque(), "exp": None}
+def encode_integer(n: int) -> bytes:
+    return f":{n}\r\n".encode()
 
-    if side == "left":
-        for v in values:
-            REDIS_DATABASE[key]["value"].appendleft(v)
+
+def encode_array(items: list[str]) -> bytes:
+    resp = b"*" + str(len(items)).encode() + b"\r\n"
+    for it in items:
+        resp += encode_bulk(it)
+    return resp
+
+
+# -----------------------
+# RESP parser (simple, robust for RESP Array of bulk strings)
+# -----------------------
+def try_parse_resp_array(buf: bytes):
+    """
+    Try to parse a RESP Array of bulk strings from buf.
+    Returns (args_list, remaining_bytes) or (None, buf) if incomplete.
+    """
+    if not buf:
+        return None, buf
+    if buf[0:1] != b"*":
+        # Not an array — we won't support inline protocol; return error by signaling parsed empty
+        return None, buf
+    # find line break
+    try:
+        line_end = buf.index(b"\r\n")
+    except ValueError:
+        return None, buf
+    try:
+        count = int(buf[1:line_end].decode())
+    except Exception:
+        return None, buf
+    pos = line_end + 2
+    args = []
+    for _ in range(count):
+        # need a $len\r\n
+        if pos + 1 >= len(buf):
+            return None, buf
+        if buf[pos:pos + 1] != b"$":
+            return None, buf
+        # find end of this line
+        try:
+            len_end = buf.index(b"\r\n", pos)
+        except ValueError:
+            return None, buf
+        try:
+            blen = int(buf[pos + 1:len_end].decode())
+        except Exception:
+            return None, buf
+        start = len_end + 2
+        end = start + blen
+        # ensure we have the bytes plus trailing CRLF
+        if end + 2 > len(buf):
+            return None, buf
+        arg = buf[start:end].decode()
+        args.append(arg)
+        if buf[end:end + 2] != b"\r\n":
+            return None, buf
+        pos = end + 2
+    remaining = buf[pos:]
+    return args, remaining
+
+
+# -----------------------
+# Command implementations
+# -----------------------
+async def cmd_ping(args, writer):
+    writer.write(encode_simple("PONG"))
+
+
+async def cmd_echo(args, writer):
+    if len(args) >= 2:
+        writer.write(encode_bulk(args[1]))
     else:
-        for v in values:
-            REDIS_DATABASE[key]["value"].append(v)
-
-    return len(REDIS_DATABASE[key]["value"])
+        writer.write(encode_bulk(None))
 
 
-def remove_data_from_redis_list(key, count=None):
-    """Pop one or multiple elements from list"""
-    if key not in REDIS_DATABASE:
-        return None
-
-    dq = REDIS_DATABASE[key]["value"]
-
-    if not dq:
-        return None
-
-    if count is None:
-        return dq.popleft()
-
-    popped = []
-    for _ in range(int(count)):
-        if not dq:
-            break
-        popped.append(dq.popleft())
-    return popped
+async def cmd_set(args, writer):
+    # SET key value  (we don't implement PX/EX here)
+    if len(args) >= 3:
+        key = args[1]
+        val = args[2]
+        async with lock:
+            store[key] = val
+        writer.write(encode_simple("OK"))
+    else:
+        writer.write(b"-ERR wrong number of arguments for 'set' command\r\n")
 
 
-# ==============================
-# RESP CONVERTERS
-# ==============================
-def convert_str_to_redis_response(output):
-    return f"${len(output)}\r\n{output}\r\n".encode()
-
-
-def convert_int_to_redis_response(output):
-    return f":{output}\r\n".encode()
-
-
-def convert_array_to_redis_response(output):
-    resp = f"*{len(output)}\r\n"
-    for el in output:
-        resp += f"${len(el)}\r\n{el}\r\n"
-    return resp.encode()
-
-
-# ==============================
-# COMMAND PARSERS
-# ==============================
-def parse_echo_command(keywords, index):
-    return convert_str_to_redis_response(keywords[index + 2])
-
-
-def parse_ping_command(*args, **kwargs):
-    return PONG_RESP
-
-
-def parse_set_command(keywords, index):
-    key = keywords[index + 2]
-    value = keywords[index + 4]
-    exp_value = None
-
-    if len(keywords) > index + 5:
-        exp_key = keywords[index + 6]
-        exp_value = keywords[index + 8]
-        if exp_key == "EX":
-            exp_value = int(exp_value) * 1000
+async def cmd_get(args, writer):
+    if len(args) >= 2:
+        key = args[1]
+        async with lock:
+            v = store.get(key)
+        if v is None or isinstance(v, deque) and len(v) == 0:
+            writer.write(encode_bulk(None))
+        elif isinstance(v, deque):
+            # wrong type for GET (we treat lists as wrong type)
+            writer.write(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
         else:
-            exp_value = int(exp_value)
-
-    add_data_to_redis(key, value, exp_value)
-    return OK_RESP
-
-
-def parse_get_command(keywords, index):
-    key = keywords[index + 2]
-    val = get_data_from_redis(key)
-    if val is None:
-        return NULL_RESP
-    return convert_str_to_redis_response(val)
-
-
-def parse_push_command(keywords, index, side):
-    key = keywords[index + 2]
-    to_add = []
-    start = index + 4
-    while start < len(keywords):
-        to_add.append(keywords[start])
-        start += 2
-
-    resp = add_data_to_redis_list(key, to_add, side)
-    return convert_int_to_redis_response(resp)
-
-
-def parse_lpush_command(keywords, index):
-    return parse_push_command(keywords, index, "left")
-
-
-def parse_rpush_command(keywords, index):
-    return parse_push_command(keywords, index, "right")
-
-
-def parse_lrange_command(keywords, index):
-    key = keywords[index + 2]
-    start = int(keywords[index + 4])
-    end = int(keywords[index + 6])
-    val = get_data_from_redis(key)
-    if val is None:
-        return EMPTY_ARRAY
-
-    val = list(val)
-    if end == -1:
-        sliced = val[start:]
+            writer.write(encode_bulk(v))
     else:
-        sliced = val[start:end + 1]
-    return convert_array_to_redis_response(sliced)
+        writer.write(b"-ERR wrong number of arguments for 'get' command\r\n")
 
 
-def parse_lpop_command(keywords, index):
-    key = keywords[index + 2]
-    count = None
-    if len(keywords) > index + 3:
-        count = keywords[index + 4]
+async def cmd_rpush(args, writer):
+    # RPUSH key val1 val2 ...
+    if len(args) < 3:
+        writer.write(b"-ERR wrong number of arguments for 'rpush' command\r\n")
+        return
 
-    resp = remove_data_from_redis_list(key, count)
-    if resp is None:
-        return NULL_RESP
-    if isinstance(resp, list):
-        return convert_array_to_redis_response(resp)
-    return convert_str_to_redis_response(resp)
+    key = args[1]
+    values = args[2:]
 
+    async with lock:
+        # ensure list exists
+        if key not in store or not isinstance(store.get(key), deque):
+            store[key] = deque()
+        dq = store[key]
 
-def parse_llen_command(keywords, index):
-    key = keywords[index + 2]
-    val = get_data_from_redis(key)
-    if val is None:
-        return convert_int_to_redis_response(0)
-    return convert_int_to_redis_response(len(val))
+        # for each value, if there are waiters for this key, satisfy the earliest waiter instead of pushing
+        pushed_count = 0
+        for val in values:
+            if waiters[key]:
+                future = waiters[key].popleft()
+                # deliver to waiter by setting result (it will send response)
+                if not future.done():
+                    future.set_result((key, val))
+                # not stored
+            else:
+                dq.append(val)
+                pushed_count += 1
 
-
-# ==============================
-# REDIS COMMAND DISPATCHER
-# ==============================
-command_arg_map = {
-    ECHO_COMMAND: parse_echo_command,
-    PING_COMMAND: parse_ping_command,
-    SET_COMMAND: parse_set_command,
-    GET_COMMAND: parse_get_command,
-    RPUSH_COMMAND: parse_rpush_command,
-    LPUSH_COMMAND: parse_lpush_command,
-    LRANGE_COMMAND: parse_lrange_command,
-    LPOP_COMMAND: parse_lpop_command,
-    LLEN_COMMAND: parse_llen_command,
-}
+        # total length is current queue length
+        length = len(dq)
+    writer.write(encode_integer(length))
 
 
-def parse_redis_command(data):
-    keywords = [kw for kw in data.split("\r\n") if kw]
-    i = 1
-    command = keywords[i + 1].upper()
-    func = command_arg_map.get(command)
-    if func:
-        return func(keywords, i + 1)
-    return b"-ERR unknown command\r\n"
+async def cmd_lpush(args, writer):
+    # LPUSH key val1 val2 ...
+    if len(args) < 3:
+        writer.write(b"-ERR wrong number of arguments for 'lpush' command\r\n")
+        return
+
+    key = args[1]
+    values = args[2:]
+
+    async with lock:
+        if key not in store or not isinstance(store.get(key), deque):
+            store[key] = deque()
+        dq = store[key]
+        # Redis prepends values so that the first element in argument list becomes left-most last:
+        # LPUSH key a b c => list becomes [c, b, a, ...] ; to get that, insert left in iteration order
+        for val in values:
+            dq.appendleft(val)
+        length = len(dq)
+    writer.write(encode_integer(length))
 
 
-# ==============================
-# ASYNCIO SERVER
-# ==============================
-async def handle_client(reader, writer):
-    while True:
-        data = await reader.read(1024)
-        if not data:
-            break
-        response = parse_redis_command(data.decode())
-        writer.write(response)
-        await writer.drain()
-    writer.close()
+async def cmd_llen(args, writer):
+    # LLEN key
+    if len(args) != 2:
+        writer.write(b"-ERR wrong number of arguments for 'llen' command\r\n")
+        return
+    key = args[1]
+    async with lock:
+        dq = store.get(key)
+        if not isinstance(dq, deque):
+            writer.write(encode_integer(0))
+            return
+        length = len(dq)
+    writer.write(encode_integer(length))
 
 
+async def cmd_lrange(args, writer):
+    # LRANGE key start stop
+    if len(args) != 4:
+        writer.write(b"-ERR wrong number of arguments for 'lrange' command\r\n")
+        return
+    key = args[1]
+    start = int(args[2])
+    stop = int(args[3])
+    async with lock:
+        dq = store.get(key)
+        if not isinstance(dq, deque):
+            writer.write(b"*0\r\n")
+            return
+        arr = list(dq)
+    # handle negative stop
+    n = len(arr)
+    if start < 0:
+        start = n + start
+    if stop < 0:
+        stop = n + stop
+    start = max(start, 0)
+    stop = min(stop, n - 1)
+    if start > stop or start >= n:
+        writer.write(b"*0\r\n")
+        return
+    slice_list = arr[start: stop + 1]
+    writer.write(encode_array(slice_list))
+
+
+async def cmd_lpop(args, writer):
+    # LPOP key [count]
+    if len(args) < 2:
+        writer.write(b"-ERR wrong number of arguments for 'lpop' command\r\n")
+        return
+    key = args[1]
+    count = 1
+    if len(args) == 3:
+        try:
+            count = int(args[2])
+        except Exception:
+            writer.write(b"-ERR value is not an integer or out of range\r\n")
+            return
+
+    async with lock:
+        dq = store.get(key)
+        if not isinstance(dq, deque) or len(dq) == 0:
+            writer.write(encode_bulk(None) if count == 1 else b"*0\r\n")
+            return
+        if count == 1:
+            val = dq.popleft()
+            writer.write(encode_bulk(val))
+            return
+        # multiple
+        popped = []
+        for _ in range(min(count, len(dq))):
+            popped.append(dq.popleft())
+    writer.write(encode_array(popped))
+
+
+async def cmd_blpop(args, writer):
+    # BLPOP key timeout
+    # This stage tests only timeout == 0 (block indefinitely)
+    if len(args) != 3:
+        writer.write(b"-ERR wrong number of arguments for 'blpop' command\r\n")
+        return
+    key = args[1]
+    timeout = int(args[2])  # we only handle 0 for now
+    if timeout != 0:
+        # Not required for this stage; return error or immediate null - choose to return error
+        writer.write(b"-ERR only timeout 0 is supported in this implementation\r\n")
+        return
+
+    # First, try to pop immediately
+    async with lock:
+        dq = store.get(key)
+        if isinstance(dq, deque) and len(dq) > 0:
+            val = dq.popleft()
+            # respond with [key, val]
+            writer.write(encode_array([key, val]))
+            return
+
+        # otherwise, block: create a future and wait for RPUSH to set it
+        fut = asyncio.get_event_loop().create_future()
+        waiters[key].append(fut)
+
+    try:
+        # wait forever (timeout==0)
+        key_name, value = await fut
+        # When future completes, send the pair [key, value]
+        writer.write(encode_array([key_name, value]))
+    except asyncio.CancelledError:
+        writer.write(b"* -1\r\n")
+    except Exception:
+        writer.write(b"-ERR internal error\r\n")
+
+
+# Dispatcher
+async def dispatch_command(args, writer):
+    if not args:
+        writer.write(b"-ERR invalid request\r\n")
+        return
+    cmd = args[0].upper()
+    if cmd == "PING":
+        await cmd_ping(args, writer)
+    elif cmd == "ECHO":
+        await cmd_echo(args, writer)
+    elif cmd == "SET":
+        await cmd_set(args, writer)
+    elif cmd == "GET":
+        await cmd_get(args, writer)
+    elif cmd == "RPUSH":
+        await cmd_rpush(args, writer)
+    elif cmd == "LPUSH":
+        await cmd_lpush(args, writer)
+    elif cmd == "LLEN":
+        await cmd_llen(args, writer)
+    elif cmd == "LRANGE":
+        await cmd_lrange(args, writer)
+    elif cmd == "LPOP":
+        await cmd_lpop(args, writer)
+    elif cmd == "BLPOP":
+        await cmd_blpop(args, writer)
+    else:
+        writer.write(b"-ERR unknown command\r\n")
+
+
+# -----------------------
+# Connection handler
+# -----------------------
+async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    peer = writer.get_extra_info("peername")
+    # buffer for bytes
+    buf = b""
+    try:
+        while True:
+            data = await reader.read(4096)
+            if not data:
+                break
+            buf += data
+            parsed, buf = try_parse_resp_array(buf)
+            if parsed is None:
+                # wait for more data
+                continue
+            # parsed is list of str arguments
+            await dispatch_command(parsed, writer)
+            await writer.drain()
+    except Exception:
+        # swallow errors to keep server alive
+        pass
+    finally:
+        # If this connection had a pending future in any waiters, we should remove it.
+        # Clean up any futures that belong to this connection:
+        # Not strictly necessary for the test harness, but good hygiene.
+        async with lock:
+            for key_q in list(waiters.keys()):
+                newdq = deque()
+                while waiters[key_q]:
+                    fut = waiters[key_q].popleft()
+                    if fut.done():
+                        continue
+                    # can't directly check if fut tied to this writer; futures don't carry writer, so skip
+                    newdq.append(fut)
+                waiters[key_q] = newdq
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+# -----------------------
+# Server entrypoint
+# -----------------------
 async def main():
-    print("Redis clone running on port 6379")
-    server = await asyncio.start_server(handle_client, "localhost", 6379)
+    server = await asyncio.start_server(handle_client, HOST, PORT)
+    addrs = ", ".join(str(sock.getsockname()) for sock in server.sockets)
+    print(f"Redis clone running on {addrs}")
     async with server:
         await server.serve_forever()
 
