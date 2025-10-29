@@ -353,7 +353,37 @@ def handle_command(cmd):
             return encode_array(keys_out)
         else:
             return encode_array([])
+    elif op == "LRANGE":
+        # LRANGE key start stop
+        if len(cmd) != 4:
+            return b"-ERR wrong number of arguments for 'lrange'\r\n"
+        key = cmd[1]
+        try:
+            start = int(cmd[2])
+            stop = int(cmd[3])
+        except ValueError:
+            return b"-ERR value is not an integer or out of range\r\n"
 
+        if key not in data_store:
+            return encode_array([])
+
+        val, expiry = data_store[key]
+        if not isinstance(val, list):
+            return encode_array([])
+
+        # Normalize stop like Redis: inclusive and handle negatives
+        n = len(val)
+        if start < 0:
+            start = n + start
+        if stop < 0:
+            stop = n + stop
+        start = max(start, 0)
+        stop = min(stop, n - 1)
+        if start > stop or start >= n:
+            return encode_array([])
+
+        sliced = val[start:stop + 1]
+        return encode_array(sliced)
     else:
         return b"-ERR unknown command\r\n"
 
