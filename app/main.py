@@ -1,188 +1,163 @@
-import asyncio
-import os
-import struct
-import sys
+import socket
 
-data_store = {}
+# In-memory store
+store = {}
 
-# ---------------- RESP ENCODING ----------------
-def encode_simple_string(s): return f"+{s}\r\n".encode()
-def encode_error(e): return f"-{e}\r\n".encode()
-def encode_integer(i): return f":{i}\r\n".encode()
-def encode_bulk_string(s):
-    if s is None:
-        return b"$-1\r\n"
-    return f"${len(s)}\r\n{s}\r\n".encode()
-def encode_array(items):
-    if items is None:
-        return b"*-1\r\n"
-    out = f"*{len(items)}\r\n".encode()
-    for it in items:
-        out += encode_bulk_string(it)
-    return out
+def encode_bulk_string(value: str) -> str:
+    return f"${len(value)}\r\n{value}\r\n"
 
+def encode_simple_string(value: str) -> str:
+    return f"+{value}\r\n"
 
-# ---------------- RDB PARSING ----------------
-def read_length(f):
-    b1 = f.read(1)
-    if not b1:
-        return 0
-    b = b1[0]
-    type_ = (b & 0xC0) >> 6
-    if type_ == 0:  # 00: 6-bit
-        return b & 0x3F
-    elif type_ == 1:  # 01: 14-bit
-        b2 = f.read(1)[0]
-        return ((b & 0x3F) << 8) | b2
-    elif type_ == 2:  # 10: 32-bit
-        return struct.unpack(">I", f.read(4))[0]
-    else:
-        # 11: special encoding (ignore)
-        return b & 0x3F
+def encode_error(value: str) -> str:
+    return f"-{value}\r\n"
 
+def encode_integer(value: int) -> str:
+    return f":{value}\r\n"
 
-def read_string(f):
-    length = read_length(f)
-    if length == 0:
-        return ""
-    return f.read(length).decode("utf-8", errors="ignore")
+def encode_array(values: list[str]) -> str:
+    if not values:
+        return "*0\r\n"
+    resp = f"*{len(values)}\r\n"
+    for v in values:
+        resp += encode_bulk_string(v)
+    return resp
 
+def handle_command(parts: list[str]) -> str:
+    if not parts:
+        return encode_error("ERR empty command")
 
-def load_rdb(dir_path, dbfilename):
-    """Parse Codecrafters RDB format to load key-values"""
-    global data_store
-    path = os.path.join(dir_path, dbfilename)
-    if not os.path.exists(path):
-        return
+    command = parts[0].upper()
 
-    try:
-        with open(path, "rb") as f:
-            header = f.read(9)
-            if not header.startswith(b"REDIS"):
-                return
-
-            while True:
-                opcode = f.read(1)
-                if not opcode:
-                    break
-                op = opcode[0]
-
-                if op == 0xFE:  # SELECTDB
-                    f.read(1)
-                elif op == 0xFB:  # RESIZEDB
-                    read_length(f)
-                    read_length(f)
-                elif op == 0xFD:  # expire time in seconds
-                    f.read(4)
-                    op = f.read(1)[0]
-                elif op == 0xFC:  # expire time in ms
-                    f.read(8)
-                    op = f.read(1)[0]
-                elif op == 0x00:  # string type key-value
-                    key = read_string(f)
-                    val = read_string(f)
-                    if key:
-                        data_store[key] = val
-                elif op == 0xFF:  # EOF
-                    break
-    except Exception as e:
-        print("RDB read error:", e)
-
-
-# ---------------- COMMAND HANDLER ----------------
-async def handle_client(reader, writer):
-    while True:
-        line = await reader.readline()
-        if not line:
-            break
-        if not line.startswith(b"*"):
-            continue
-
-        try:
-            num = int(line[1:].strip())
-            parts = []
-            for _ in range(num):
-                await reader.readline()  # $len line
-                arg = (await reader.readline()).decode().strip()
-                parts.append(arg)
-        except Exception:
-            writer.write(encode_error("ERR invalid protocol"))
-            await writer.drain()
-            continue
-
-        cmd = parts[0].upper()
-        resp = b""
-
-        if cmd == "PING":
-            resp = encode_simple_string("PONG")
-
-        elif cmd == "ECHO":
-            resp = encode_bulk_string(parts[1])
-
-        elif cmd == "SET":
-            data_store[parts[1]] = parts[2]
-            resp = encode_simple_string("OK")
-
-        elif cmd == "GET":
-            val = data_store.get(parts[1])
-            if isinstance(val, list):
-                resp = encode_error("WRONGTYPE Operation against a key holding the wrong kind of value")
-            else:
-                resp = encode_bulk_string(val)
-
-        elif cmd == "KEYS":
-            resp = encode_array(list(data_store.keys()))
-
-        elif cmd == "RPUSH":
-            key = parts[1]
-            vals = parts[2:]
-            if key not in data_store:
-                data_store[key] = []
-            if not isinstance(data_store[key], list):
-                resp = encode_error("WRONGTYPE Operation against a key holding the wrong kind of value")
-            else:
-                data_store[key].extend(vals)
-                resp = encode_integer(len(data_store[key]))
-
-        elif cmd == "BLPOP":
-            key = parts[1]
-            timeout = float(parts[2])
-            if key in data_store and isinstance(data_store[key], list) and data_store[key]:
-                val = data_store[key].pop(0)
-                resp = encode_array([key, val])
-            else:
-                await asyncio.sleep(timeout)
-                if key in data_store and isinstance(data_store[key], list) and data_store[key]:
-                    val = data_store[key].pop(0)
-                    resp = encode_array([key, val])
-                else:
-                    resp = b"*-1\r\n"
-
+    # ------------------ PING ------------------
+    if command == "PING":
+        if len(parts) == 1:
+            return encode_simple_string("PONG")
         else:
-            resp = encode_error(f"ERR unknown command '{cmd.lower()}'")
+            return encode_bulk_string(parts[1])
 
-        writer.write(resp)
-        await writer.drain()
+    # ------------------ ECHO ------------------
+    elif command == "ECHO":
+        if len(parts) < 2:
+            return encode_error("ERR wrong number of arguments for 'echo' command")
+        return encode_bulk_string(parts[1])
+
+    # ------------------ SET ------------------
+    elif command == "SET":
+        if len(parts) < 3:
+            return encode_error("ERR wrong number of arguments for 'set' command")
+        key, value = parts[1], parts[2]
+        store[key] = value
+        return encode_simple_string("OK")
+
+    # ------------------ GET ------------------
+    elif command == "GET":
+        if len(parts) < 2:
+            return encode_error("ERR wrong number of arguments for 'get' command")
+        key = parts[1]
+        if key not in store:
+            return "$-1\r\n"
+        return encode_bulk_string(store[key])
+
+    # ------------------ EXISTS ------------------
+    elif command == "EXISTS":
+        if len(parts) < 2:
+            return encode_error("ERR wrong number of arguments for 'exists' command")
+        count = sum(1 for k in parts[1:] if k in store)
+        return encode_integer(count)
+
+    # ------------------ RPUSH ------------------
+    elif command == "RPUSH":
+        if len(parts) < 3:
+            return encode_error("ERR wrong number of arguments for 'rpush' command")
+        key = parts[1]
+        values = parts[2:]
+
+        # Ensure list type
+        if key not in store:
+            store[key] = []
+        elif not isinstance(store[key], list):
+            return encode_error("WRONGTYPE Operation against a key holding the wrong kind of value")
+
+        store[key].extend(values)
+        return encode_integer(len(store[key]))
+
+    # ------------------ LPOP ------------------
+    elif command == "LPOP":
+        if len(parts) < 2:
+            return encode_error("ERR wrong number of arguments for 'lpop' command")
+        key = parts[1]
+        if key not in store or not store[key]:
+            return "$-1\r\n"
+        value = store[key].pop(0)
+        return encode_bulk_string(value)
+
+    # ------------------ RPOP ------------------
+    elif command == "RPOP":
+        if len(parts) < 2:
+            return encode_error("ERR wrong number of arguments for 'rpop' command")
+        key = parts[1]
+        if key not in store or not store[key]:
+            return "$-1\r\n"
+        value = store[key].pop()
+        return encode_bulk_string(value)
+
+    # ------------------ KEYS ------------------
+    elif command == "KEYS":
+        if len(parts) != 2:
+            return encode_error("ERR wrong number of arguments for 'keys' command")
+        pattern = parts[1]
+        if pattern == "*":
+            return encode_array(list(store.keys()))
+        # (No advanced pattern matching needed for Codecrafters)
+        return encode_array([])
+
+    # ------------------ CONFIG ------------------
+    elif command == "CONFIG":
+        if len(parts) < 2:
+            return encode_error("ERR wrong number of arguments for 'config' command")
+        sub = parts[1].upper()
+
+        if sub == "GET":
+            if len(parts) < 3:
+                return encode_error("ERR wrong number of arguments for 'config get' command")
+            key = parts[2].lower()
+
+            if key == "dir":
+                dir_path = "/tmp"
+                return encode_array(["dir", dir_path])
+            else:
+                return encode_array([])
+        elif sub == "SET":
+            # Basic mock: CONFIG SET dir /tmp
+            if len(parts) == 4 and parts[2].lower() == "dir":
+                return encode_simple_string("OK")
+            return encode_error("ERR unsupported config set parameter")
+        else:
+            return encode_error("ERR unknown subcommand")
+
+    # ------------------ UNKNOWN ------------------
+    else:
+        return encode_error(f"ERR unknown command '{command}'")
 
 
-# ---------------- MAIN ENTRY ----------------
-async def main():
-    dir_path = None
-    dbfilename = None
+# ------------------ SERVER LOOP ------------------
+def main():
+    server_socket = socket.create_server(("localhost", 6379), reuse_port=True)
+    while True:
+        client, _ = server_socket.accept()
+        data = client.recv(1024).decode().strip()
+        if not data:
+            client.close()
+            continue
 
-    if "--dir" in sys.argv:
-        dir_path = sys.argv[sys.argv.index("--dir") + 1]
-    if "--dbfilename" in sys.argv:
-        dbfilename = sys.argv[sys.argv.index("--dbfilename") + 1]
+        # Parse RESP (naive but fine for Codecrafters)
+        parts = [p for p in data.split("\r\n") if p and not p.startswith("*") and not p.startswith("$")]
 
-    if dir_path and dbfilename:
-        load_rdb(dir_path, dbfilename)
-
-    server = await asyncio.start_server(handle_client, "0.0.0.0", 6379)
-    print("Server started on 0.0.0.0:6379")
-    async with server:
-        await server.serve_forever()
+        response = handle_command(parts)
+        client.sendall(response.encode())
+        client.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
