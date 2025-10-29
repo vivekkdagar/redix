@@ -178,6 +178,27 @@ def handle_command(cmd):
 
         return encode_integer(len(list_val))
 
+        # --- FIX: Implement RPUSH ---
+    elif op == "RPUSH":
+        key = cmd[1]
+        elements = cmd[2:]
+
+        if key not in data_store:
+            data_store[key] = ([], -1)
+
+        list_val, expiry = data_store[key]
+
+        if not isinstance(list_val, list):
+            list_val = []
+            data_store[key] = (list_val, expiry)
+
+        # Append (to the right)
+        for element in elements:
+            list_val.append(element)
+
+        # Return the new list length as integer
+        return encode_integer(len(list_val))
+
     # --- FIX 2: Update BLPOP to pop if list is not empty ---
     elif op == "BLPOP":
         list_key = cmd[1]
