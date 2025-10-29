@@ -295,6 +295,8 @@ def handle_command(cmd, conn=None):
         return encode_array([])
 
     # --- SUBSCRIBE channel ---
+    # --- SUBSCRIBE channel ---
+    # --- SUBSCRIBE channel ---
     if op == "SUBSCRIBE":
         if len(cmd) < 2:
             return b"-ERR wrong number of arguments for 'subscribe'\r\n"
@@ -303,10 +305,10 @@ def handle_command(cmd, conn=None):
             if channel not in CHANNELS:
                 CHANNELS[channel] = []
             CHANNELS[channel].append(conn)
-        # Respond immediately per Redis spec
-        resp = encode_array(["subscribe", channel, 1])
+        # RESP array: ["subscribe", channel, (integer)1]
+        resp = b"*3\r\n" + encode_bulk("subscribe") + encode_bulk(channel) + encode_integer(1)
         conn.sendall(resp)
-        # Keep the connection open (no further command reads)
+        # Keep connection alive (subscribed mode)
         try:
             while True:
                 time.sleep(1)
