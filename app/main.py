@@ -264,6 +264,17 @@ def handle_command(parts: list[str]) -> str:
         if len(parts) != 2:
             return encode_error("ERR wrong number of arguments for 'keys' command")
         pattern = parts[1]
+
+        # Debug: Try to load RDB file NOW if store is empty
+        if len(store) == 0:
+            rdb_path = os.path.join(config["dir"], config["dbfilename"])
+            print(f"KEYS: Store is empty, trying to load RDB from: {rdb_path}", flush=True)
+            print(f"KEYS: File exists? {os.path.exists(rdb_path)}", flush=True)
+            if os.path.exists(rdb_path):
+                print(f"KEYS: File size: {os.path.getsize(rdb_path)} bytes", flush=True)
+                parse_rdb_file(rdb_path)
+                print(f"KEYS: Store after parse attempt: {list(store.keys())}", flush=True)
+
         print(f"KEYS command - pattern: {pattern}, store keys: {list(store.keys())}", flush=True)
         print(f"KEYS command - config: {config}", flush=True)
         print(f"KEYS command - sys.argv: {sys.argv}", flush=True)
