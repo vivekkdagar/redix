@@ -579,7 +579,7 @@ def cmd_executor(decoded_data, connection, config, queued, executing):
     """
     decoded_data: list of strings (command + args)
     connection: socket
-    config: config dict for this server (role, etc)
+    config: server config dictionary (role, dir, dbfilename, store etc)
     queued: boolean — currently queuing transaction commands
     executing: boolean — currently executing queued commands
     Returns: (response_or_empty, queued_boolean)
@@ -591,47 +591,49 @@ def cmd_executor(decoded_data, connection, config, queued, executing):
 
     cmd = decoded_data[0].upper()
 
-    # If connection is in subscribed mode, limit allowed commands
+    # --- Handle subscribed mode ---
     if connection in SUBSCRIBE_MODE:
-        # allowed: SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE, PUNSUBSCRIBE, PING, QUIT
+        allowed = ("SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE", "PUNSUBSCRIBE", "PING", "QUIT")
+        if cmd not in allowed:
+            connection.sendall(error_encoder(f"ERR Can't execute '{decoded_data[0]}'"))
+            return (b"", queued)
+
         if cmd == "SUBSCRIBE":
             ch = decoded_data[1]
             subscriptions.setdefault(connection, set())
-            if ch not in subscriptions[connection]:
-                subscriptions[connection].add(ch)
-            # reply ["subscribe", channel, count]
+            subscriptions[connection].add(ch)
             response = resp_encoder(["subscribe", ch, len(subscriptions[connection])])
             connection.sendall(response)
             return (b"", queued)
+
         if cmd == "UNSUBSCRIBE":
             ch = decoded_data[1] if len(decoded_data) > 1 else None
             if ch and connection in subscriptions and ch in subscriptions[connection]:
                 subscriptions[connection].remove(ch)
-            # reply generic unsubscribed array
             response = resp_encoder(["unsubscribe", ch, len(subscriptions.get(connection, []))])
             connection.sendall(response)
             return (b"", queued)
+
         if cmd == "PING":
-            # In subscribed mode PING can have special behavior — we return ["pong",""] per your snippet
             response = resp_encoder(["pong", ""])
             connection.sendall(response)
             return (b"", queued)
-        if cmd in ("PSUBSCRIBE", "PUNSUBSCRIBE", "QUIT"):
-            # minimal handling
-            return (b"", queued)
-        # not allowed
-        connection.sendall(error_encoder(f"ERR Can't execute '{decoded_data[0]}'"))
+
+        # PSUBSCRIBE, PUNSUBSCRIBE, QUIT can be ignored safely
         return (b"", queued)
 
-    # Transaction queueing
+    # --- Transaction queuing ---
     conn_id = id(connection)
     if conn_id in connections_tx and connections_tx[conn_id].get('in_transaction', False):
-        # if it's not EXEC or DISCARD, queue
         if cmd not in ("EXEC", "DISCARD"):
             connections_tx[conn_id]['commands'].append(decoded_data)
             connection.sendall(simple_string_encoder("QUEUED"))
             return (b"", True)
-    # Implement commands
+
+    # -----------------------------
+    # Standard command processing
+    # -----------------------------
+
     if cmd == "PING":
         if len(decoded_data) == 1:
             connection.sendall(simple_string_encoder("PONG"))
@@ -640,42 +642,51 @@ def cmd_executor(decoded_data, connection, config, queued, executing):
         return (b"", queued)
 
     if cmd == "ECHO":
-        if len(decoded_data) > 1:
-            connection.sendall(resp_encoder(decoded_data[1]))
-        else:
-            connection.sendall(resp_encoder(""))
+        msg = decoded_data[1] if len(decoded_data) > 1 else ""
+        connection.sendall(resp_encoder(msg))
         return (b"", queued)
 
     if cmd == "SET":
         if len(decoded_data) >= 3:
             setter(decoded_data[1:])
             connection.sendall(simple_string_encoder("OK"))
-            prev_cmd = "SET"
             return (b"", queued)
         connection.sendall(error_encoder("ERR wrong number of arguments for 'set'"))
         return (b"", queued)
 
-    elif cmd.upper() == "GET":
-        print("role", config["role"])
+    # ✅ Fixed GET handling (works for normal + RDB-loaded values)
+    elif cmd == "GET" and len(decoded_data) >= 2:
         key = decoded_data[1]
-
-        # First check in-memory store via getter()
+        print("role", config.get("role"))
         value = getter(key)
 
-        # Fallback: check in RDB-loaded config store
+        # If not in-memory, check RDB-loaded data
         if value is None and "store" in config and key in config["store"]:
             val = config["store"][key]
-            value = val[0] if isinstance(val, tuple) else val
+            if isinstance(val, tuple):
+                stored_value, expiry = val
+                # check expiry
+                if expiry == -1 or expiry > time.time():
+                    value = stored_value
+            else:
+                value = val
 
-        # Encode and send
-        response = resp_encoder(value)
+        # If still None → return empty bulk string instead of null
+        if value is None:
+            response = b"$0\r\n\r\n"
+        else:
+            encoded = str(value).encode()
+            response = b"$" + str(len(encoded)).encode() + b"\r\n" + encoded + b"\r\n"
+
         print(f"GET response: {response}")
         if executing:
             return response, queued
         connection.sendall(response)
-        return [], queued
+        return (b"", queued)
 
+    # -----------------------------
     # Lists
+    # -----------------------------
     if cmd == "RPUSH":
         if len(decoded_data) >= 3:
             size = rpush(decoded_data[1:], blocked)
@@ -725,7 +736,6 @@ def cmd_executor(decoded_data, connection, config, queued, executing):
         if len(decoded_data) >= 3:
             res = blpop(decoded_data[1:], connection, blocked)
             if res is None:
-                # blocked: no immediate response
                 return (b"", queued)
             else:
                 connection.sendall(resp_encoder(res))
@@ -733,7 +743,9 @@ def cmd_executor(decoded_data, connection, config, queued, executing):
         connection.sendall(error_encoder("ERR wrong number of arguments for 'blpop'"))
         return (b"", queued)
 
+    # -----------------------------
     # Streams
+    # -----------------------------
     if cmd == "XADD":
         if len(decoded_data) >= 4:
             status, payload = xadd(decoded_data[1:], blocked_xread)
@@ -754,8 +766,7 @@ def cmd_executor(decoded_data, connection, config, queued, executing):
         return (b"", queued)
 
     if cmd == "XREAD":
-        # minimal support
-        if decoded_data[1].upper() == "BLOCK":
+        if len(decoded_data) >= 2 and decoded_data[1].upper() == "BLOCK":
             res = blocks_xread(decoded_data[2:], connection, blocked_xread)
             if res is None:
                 return (b"", queued)
@@ -767,7 +778,9 @@ def cmd_executor(decoded_data, connection, config, queued, executing):
             connection.sendall(resp_encoder(res))
             return (b"", queued)
 
+    # -----------------------------
     # Transactions
+    # -----------------------------
     if cmd == "INCR":
         if len(decoded_data) >= 2:
             k = decoded_data[1]
@@ -790,14 +803,11 @@ def cmd_executor(decoded_data, connection, config, queued, executing):
         if not txinfo or not txinfo.get('in_transaction'):
             connection.sendall(error_encoder("ERR EXEC without MULTI"))
             return (b"", queued)
-        # execute queued commands
         q = txinfo['commands']
         responses = []
         for c in q:
-            # each c is a list of strings; run executor in executing mode to get raw response
             out, _ = cmd_executor(c, connection, config, False, True)
             responses.append(out or resp_encoder(None))
-        # cleanup
         del connections_tx[id(connection)]
         connection.sendall(array_encoder(responses))
         return (b"", False)
@@ -810,7 +820,9 @@ def cmd_executor(decoded_data, connection, config, queued, executing):
         connection.sendall(error_encoder("ERR DISCARD without MULTI"))
         return (b"", queued)
 
-    # Replication & introspection
+    # -----------------------------
+    # Replication / Info / Config
+    # -----------------------------
     if cmd == "INFO":
         section = decoded_data[1] if len(decoded_data) > 1 else None
         resp = f"role:{config.get('role','master')}\n"
@@ -821,12 +833,10 @@ def cmd_executor(decoded_data, connection, config, queued, executing):
         return (b"", queued)
 
     if cmd == "REPLCONF":
-        # minimal handling: ACK, GETACK
         if len(decoded_data) >= 2 and decoded_data[1].upper() == "GETACK":
             connection.sendall(resp_encoder(["REPLCONF", "ACK", str(BYTES_READ)]))
             return (b"", queued)
         if len(decoded_data) >= 2 and decoded_data[1].upper() == "ACK":
-            global replica_acks
             replica_acks += 1
             connection.sendall(simple_string_encoder("OK"))
             return (b"", queued)
@@ -834,7 +844,6 @@ def cmd_executor(decoded_data, connection, config, queued, executing):
         return (b"", queued)
 
     if cmd == "PSYNC":
-        # Send FULLRESYNC and push RDB bytes (minimalized)
         resp = simple_string_encoder("FULLRESYNC 8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb 0")
         connection.sendall(resp)
         rdb_bytes = bytes.fromhex(RDB_HEX)
@@ -844,12 +853,10 @@ def cmd_executor(decoded_data, connection, config, queued, executing):
         return (b"", queued)
 
     if cmd == "WAIT":
-        # simple: return number of replicas
         connection.sendall(resp_encoder(len(REPLICAS)))
         return (b"", queued)
 
     if cmd == "CONFIG":
-        # CONFIG GET field
         if len(decoded_data) >= 3 and decoded_data[1].upper() == "GET":
             field = decoded_data[2]
             if field == "dir":
@@ -869,7 +876,6 @@ def cmd_executor(decoded_data, connection, config, queued, executing):
         return (b"", queued)
 
     if cmd == "SUBSCRIBE":
-        # enter subscribed mode for this connection
         SUBSCRIBE_MODE.add(connection)
         ch = decoded_data[1]
         subscriptions.setdefault(connection, set())
@@ -877,7 +883,7 @@ def cmd_executor(decoded_data, connection, config, queued, executing):
         connection.sendall(resp_encoder(["subscribe", ch, len(subscriptions[connection])]))
         return (b"", queued)
 
-    # Unknown
+    # Unknown command
     connection.sendall(error_encoder("ERR unknown command"))
     return (b"", queued)
 
