@@ -145,6 +145,7 @@ def read_length_encoded(data: bytes, idx: int):
 
 def read_key_value_pair(data: bytes, idx: int, value_type: int):
     """Read a key-value pair from RDB file"""
+    start_idx = idx
     # Read key (always a string)
     key_length, bytes_read = read_length_encoded(data, idx)
     idx += bytes_read
@@ -157,9 +158,9 @@ def read_key_value_pair(data: bytes, idx: int, value_type: int):
         idx += bytes_read
         value = data[idx:idx + value_length].decode('utf-8')
         idx += value_length
-        return key, value, idx
+        return key, value, idx - start_idx
 
-    return None, None, idx
+    return None, None, 0
 
 
 def handle_command(parts: list[str]) -> str:
@@ -293,6 +294,7 @@ def handle_command(parts: list[str]) -> str:
 def main():
     # Parse command line arguments
     args = sys.argv[1:]
+    print(f"Command line args: {args}", flush=True)
     for i in range(len(args)):
         if args[i] == "--dir" and i + 1 < len(args):
             config["dir"] = args[i + 1]
@@ -306,6 +308,7 @@ def main():
     print(f"Loading RDB file from: {rdb_path}", flush=True)
     parse_rdb_file(rdb_path)
     print(f"Store after loading RDB: {store}", flush=True)
+    print(f"Number of keys loaded: {len(store)}", flush=True)
 
     server_socket = socket.create_server(("localhost", 6379), reuse_port=True)
     print(f"Redis server listening on localhost:6379", flush=True)
