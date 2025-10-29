@@ -297,22 +297,37 @@ def handle_command(cmd, conn=None):
     # --- SUBSCRIBE channel ---
     # --- SUBSCRIBE channel ---
     # --- SUBSCRIBE channel ---
+    # --- SUBSCRIBE channel [channel ...] ---
     if op == "SUBSCRIBE":
         if len(cmd) < 2:
             return b"-ERR wrong number of arguments for 'subscribe'\r\n"
-        channel = cmd[1]
-        with STORE_COND:
-            if channel not in CHANNELS:
-                CHANNELS[channel] = []
-            CHANNELS[channel].append(conn)
-        # RESP array: ["subscribe", channel, (integer)1]
-        resp = b"*3\r\n" + encode_bulk("subscribe") + encode_bulk(channel) + encode_integer(1)
-        conn.sendall(resp)
-        # Keep connection alive (subscribed mode)
+
+        # Initialize this client's subscription set
+        subs = CLIENT_SUBSCRIPTIONS.setdefault(conn, set())
+
+        responses = []
+        for channel in cmd[1:]:
+            # Add client to the channel
+            CHANNEL_SUBSCRIBERS.setdefault(channel, set()).add(conn)
+
+            # Add channel to client’s subscriptions (set prevents duplicates)
+            subs.add(channel)
+
+            # Build per-channel response: ["subscribe", channel, count]
+            count = len(subs)
+            resp = b"*3\r\n" + encode_bulk("subscribe") + encode_bulk(channel) + encode_integer(count)
+            responses.append(resp)
+
+        # Send all responses one after another (one per channel)
+        for r in responses:
+            conn.sendall(r)
+
+        # Enter subscribed mode (infinite loop)
         try:
             while True:
                 time.sleep(1)
         except Exception:
+            # Client disconnected
             pass
         return b""
 
