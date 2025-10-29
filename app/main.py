@@ -1,239 +1,187 @@
-# main.py
-# Complete Redis server (Codecrafters) — all modules merged
-
-import argparse
 import asyncio
-import datetime
 import os
 import struct
-import time
 
-# =========================================================
-# RESP PARSER + ENCODER
-# =========================================================
+# In-memory data store
+data_store = {}
 
-def parse(data: bytes):
-    """Parse RESP array input from redis-cli"""
-    if not data or data[0:1] != b"*":
-        return []
-    lines = data.split(b"\r\n")
-    num_elems = int(lines[0][1:])
-    i = 1
-    result = []
-    while num_elems > 0:
-        if lines[i].startswith(b"$"):
-            length = int(lines[i][1:])
-            result.append(lines[i + 1].decode())
-            i += 2
-        num_elems -= 1
-    return result
+# RESP encoder helpers
+def encode_simple_string(s: str) -> bytes:
+    return f"+{s}\r\n".encode()
 
+def encode_error(err: str) -> bytes:
+    return f"-{err}\r\n".encode()
 
-def encode(data):
-    """Encode Python data to RESP protocol"""
-    if data is None:
+def encode_integer(i: int) -> bytes:
+    return f":{i}\r\n".encode()
+
+def encode_bulk_string(s: str | None) -> bytes:
+    if s is None:
         return b"$-1\r\n"
-    if isinstance(data, str):
-        return f"+{data}\r\n".encode()
-    if isinstance(data, int):
-        return f":{data}\r\n".encode()
-    if isinstance(data, list):
-        resp = f"*{len(data)}\r\n".encode()
-        for item in data:
-            if item is None:
-                resp += b"$-1\r\n"
-            else:
-                s = str(item).encode()
-                resp += f"${len(s)}\r\n".encode() + s + b"\r\n"
-        return resp
-    return f"-ERR unknown type\r\n".encode()
+    return f"${len(s)}\r\n{s}\r\n".encode()
 
+def encode_array(items: list | None) -> bytes:
+    if items is None:
+        return b"*-1\r\n"
+    resp = f"*{len(items)}\r\n".encode()
+    for item in items:
+        resp += encode_bulk_string(item)
+    return resp
 
-# =========================================================
-# RDB READER (for persistence)
-# =========================================================
-
-def read_key_val_from_db(dir, dbfilename, data):
-    rdb_file_loc = os.path.join(dir, dbfilename)
-    if not os.path.isfile(rdb_file_loc):
+# Minimal RDB parser for Codecrafters stage
+def load_rdb_file(dir_path: str, dbfilename: str):
+    global data_store
+    file_path = os.path.join(dir_path, dbfilename)
+    if not os.path.exists(file_path):
         return
 
-    with open(rdb_file_loc, "rb") as f:
-        while b := f.read(1):
-            if b == b"\xfb":
-                break
+    with open(file_path, "rb") as f:
+        content = f.read()
 
-        num_keys = struct.unpack("B", f.read(1))[0]
-        f.read(1)  # DB selector
-        for _ in range(num_keys):
-            expired = False
-            b = f.read(1)
-            if b == b"\xfc":
-                milliTime = int.from_bytes(f.read(8), "little")
-                if milliTime < datetime.datetime.now().timestamp() * 1000:
-                    expired = True
-                f.read(1)
-            elif b == b"\xfd":
-                secTime = int.from_bytes(f.read(4), "little")
-                if secTime < datetime.datetime.now().timestamp():
-                    expired = True
-                f.read(1)
+    # Very minimal parsing (enough for single key-value test)
+    # "REDIS" magic header = first 5 bytes
+    if not content.startswith(b"REDIS"):
+        return
 
-            key_len = struct.unpack("B", f.read(1))[0] & 0b00111111
-            key = f.read(key_len).decode()
-            val_len = struct.unpack("B", f.read(1))[0] & 0b00111111
-            val = f.read(val_len).decode()
-            if not expired:
-                data[key] = (val, -1)
+    idx = 9  # skip header + version
+    while idx < len(content):
+        if content[idx] == 0xFE:  # DB selector
+            idx += 2
+        elif content[idx] == 0xFA:  # Auxiliary field
+            idx += 1
+            _len = content[idx]
+            idx += 1 + _len
+            _len2 = content[idx]
+            idx += 1 + _len2
+        elif content[idx] == 0xFB:
+            idx += 1
+            _len = content[idx]
+            idx += 1 + _len
+            _len2 = content[idx]
+            idx += 1 + _len2
+        elif content[idx] == 0xFF:
+            break
+        elif content[idx] == 0x00:  # key-value pair
+            idx += 1
+            key_len = content[idx]
+            idx += 1
+            key = content[idx:idx+key_len].decode()
+            idx += key_len
+            val_len = content[idx]
+            idx += 1
+            val = content[idx:idx+val_len].decode()
+            idx += val_len
+            data_store[key] = val
+        else:
+            idx += 1
 
+# RESP command parsing
+async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    while True:
+        line = await reader.readline()
+        if not line:
+            break
 
-# =========================================================
-# REDIS CORE SERVER
-# =========================================================
+        if not line.startswith(b"*"):
+            continue
 
-async def serveRedis():
-    config = getConfig()
-    server = await asyncio.start_server(
-        lambda r, w: handleClient(config, r, w),
-        config["host"],
-        config["port"]
-    )
-    print(f"✅ Redis server started on {config['host']}:{config['port']}")
+        try:
+            arg_count = int(line[1:].strip())
+            parts = []
+            for _ in range(arg_count):
+                await reader.readline()  # $len
+                arg = (await reader.readline()).decode().strip()
+                parts.append(arg)
+        except Exception:
+            writer.write(encode_error("ERR invalid protocol"))
+            await writer.drain()
+            continue
+
+        cmd = parts[0].upper()
+
+        # ---- COMMAND HANDLERS ----
+
+        if cmd == "PING":
+            resp = encode_simple_string("PONG")
+
+        elif cmd == "ECHO":
+            resp = encode_bulk_string(parts[1])
+
+        elif cmd == "SET":
+            if len(parts) < 3:
+                resp = encode_error("ERR wrong number of arguments for 'set' command")
+            else:
+                key, value = parts[1], parts[2]
+                data_store[key] = value
+                resp = encode_simple_string("OK")
+
+        elif cmd == "GET":
+            key = parts[1]
+            value = data_store.get(key)
+            if isinstance(value, list):
+                resp = encode_error("WRONGTYPE Operation against a key holding the wrong kind of value")
+            else:
+                resp = encode_bulk_string(value)
+
+        elif cmd == "KEYS":
+            resp = encode_array(list(data_store.keys()))
+
+        elif cmd == "RPUSH":
+            if len(parts) < 3:
+                resp = encode_error("ERR wrong number of arguments for 'rpush' command")
+            else:
+                key = parts[1]
+                values = parts[2:]
+                if key not in data_store:
+                    data_store[key] = []
+                if not isinstance(data_store[key], list):
+                    resp = encode_error("WRONGTYPE Operation against a key holding the wrong kind of value")
+                else:
+                    data_store[key].extend(values)
+                    resp = encode_integer(len(data_store[key]))
+
+        elif cmd == "BLPOP":
+            if len(parts) < 3:
+                resp = encode_error("ERR wrong number of arguments for 'blpop' command")
+            else:
+                key = parts[1]
+                timeout = float(parts[2])
+                if key in data_store and isinstance(data_store[key], list) and data_store[key]:
+                    value = data_store[key].pop(0)
+                    resp = encode_array([key, value])
+                else:
+                    await asyncio.sleep(timeout)
+                    if key in data_store and isinstance(data_store[key], list) and data_store[key]:
+                        value = data_store[key].pop(0)
+                        resp = encode_array([key, value])
+                    else:
+                        resp = b"*-1\r\n"
+
+        else:
+            resp = encode_error(f"ERR unknown command '{cmd.lower()}'")
+
+        writer.write(resp)
+        await writer.drain()
+
+# ---- Entry Point ----
+async def main():
+    dir_path = None
+    dbfilename = None
+
+    # Parse command line args
+    import sys
+    if "--dir" in sys.argv:
+        dir_path = sys.argv[sys.argv.index("--dir") + 1]
+    if "--dbfilename" in sys.argv:
+        dbfilename = sys.argv[sys.argv.index("--dbfilename") + 1]
+
+    if dir_path and dbfilename:
+        load_rdb_file(dir_path, dbfilename)
+
+    server = await asyncio.start_server(handle_client, "0.0.0.0", 6379)
+    print("Server started on 0.0.0.0:6379")
     async with server:
         await server.serve_forever()
 
-
-def getConfig():
-    flag = argparse.ArgumentParser()
-    flag.add_argument("--dir", default=".", help="Directory for redis files")
-    flag.add_argument("--dbfilename", default="dump.rdb", help="Database filename")
-    flag.add_argument("--port", default="6379", help="Port to listen on")
-    flag.add_argument("--replicaof", help="Replication target (format: HOST PORT)")
-    args = flag.parse_args()
-
-    config = {
-        "store": {},
-        "port": int(args.port),
-        "host": "0.0.0.0",
-        "role": "master",
-        "dbfilename": args.dbfilename,
-        "dir": args.dir,
-        "master_replid": "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb",
-        "master_repl_offset": "0",
-        "replicaof": args.replicaof,
-    }
-
-    read_key_val_from_db(config["dir"], config["dbfilename"], config["store"])
-    return config
-
-
-async def handleClient(config, reader, writer):
-    while True:
-        raw = await reader.read(1024)
-        if not raw:
-            break
-        command = parse(raw)
-        await execute(config, command, writer)
-    writer.close()
-
-
-async def execute(config, command, writer):
-    if not command:
-        return
-
-    cmd = command[0].lower()
-    args = command[1:]
-    store = cleanStore(config["store"])
-
-    # -------------------- BASIC COMMANDS --------------------
-    if cmd == "ping":
-        writer.write(encode("PONG"))
-
-    elif cmd == "echo" and args:
-        writer.write(encode(args[0]))
-
-    elif cmd == "set" and len(args) >= 2:
-        key, value = args[0], args[1]
-        expiry = -1
-        if len(args) == 4 and args[2].lower() == "px" and args[3].isdigit():
-            expiry = time.time() + int(args[3]) / 1000
-        store[key] = (value, expiry)
-        config["store"] = store
-        writer.write(encode("OK"))
-
-    elif cmd == "get" and len(args) == 1:
-        key = args[0]
-        val = store.get(key)
-        if not val:
-            writer.write(b"$-1\r\n")
-        else:
-            v, exp = val
-            if exp != -1 and exp < time.time():
-                del store[key]
-                writer.write(b"$-1\r\n")
-            else:
-                writer.write(f"${len(v)}\r\n{v}\r\n".encode())
-
-    elif cmd == "del" and args:
-        deleted = 0
-        for k in args:
-            if k in store:
-                del store[k]
-                deleted += 1
-        writer.write(f":{deleted}\r\n".encode())
-
-    elif cmd == "config" and len(args) > 1 and args[0].lower() == "get":
-        result = []
-        for a in args[1:]:
-            if a in config:
-                result.extend([a, config[a]])
-        writer.write(encode(result))
-
-    elif cmd == "keys" and len(args) == 1 and args[0] == "*":
-        writer.write(encode(list(store.keys())))
-
-    elif cmd == "info" and len(args) == 1 and args[0].lower() == "replication":
-        lines = [f"role:{config['role']}"]
-        if config["role"] == "master":
-            lines.append(f"master_replid:{config['master_replid']}")
-            lines.append(f"master_repl_offset:{config['master_repl_offset']}")
-        writer.write(encode("\n".join(lines)))
-
-    elif cmd == "replconf":
-        writer.write(encode("OK"))
-
-    elif cmd == "psync":
-        fullsync = f"FULLRESYNC {config['master_replid']} {config['master_repl_offset']}"
-        writer.write(encode(fullsync))
-        file_contents = bytes.fromhex(
-            "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2"
-        )
-        writer.write(f"${len(file_contents)}\r\n".encode() + file_contents + b"\r\n")
-
-    elif cmd == "blpop" and len(args) >= 2:
-        key, timeout = args[0], float(args[1])
-        end_time = time.time() + timeout
-        while time.time() < end_time:
-            if key in store:
-                val, _ = store.pop(key)
-                writer.write(encode([key, val]))
-                return
-            await asyncio.sleep(0.05)
-        writer.write(b"*-1\r\n")  # RESP null array
-
-    else:
-        writer.write(b"-ERR unknown command\r\n")
-
-    await writer.drain()
-
-
-def cleanStore(store):
-    now = time.time()
-    return {k: v for k, v in store.items() if v[1] == -1 or v[1] > now}
-
-
-# =========================================================
-# ENTRY POINT
-# =========================================================
 if __name__ == "__main__":
-    asyncio.run(serveRedis())
+    asyncio.run(main())
