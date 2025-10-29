@@ -123,53 +123,59 @@ def _read_string(f) -> str:
         return ""
     return data.decode('utf-8', errors='ignore')
 
-def read_key_val_from_db(dir_path: str, dbfilename: str, store: Dict[str, Tuple[str,int]]):
-    """Populate store with string keys from RDB (best-effort; we only need keys/values for tests)."""
+def read_key_val_from_db(dir_path, dbfilename, data):
+    """Load key-values from RDB (if exists)"""
     rdb_file_loc = os.path.join(dir_path, dbfilename)
     if not os.path.isfile(rdb_file_loc):
         return
+
     try:
         with open(rdb_file_loc, "rb") as f:
+            # Read 9 bytes header: "REDIS" + version (e.g. "0009")
             header = f.read(9)
             if not header.startswith(b"REDIS"):
-                # Not an RDB we recognize — bail
                 return
-            # Now we scan file looking for payload. We follow a robust loop similar to snippet:
+
+            # Skip optional metadata sections until we find DB selector (0xFE)
             while True:
                 opcode = f.read(1)
                 if not opcode:
                     break
-                # DB selector
+
+                # Database selector
                 if opcode == b"\xfe":
-                    # database number (bulk encoded)
-                    f.read(1)
+                    _ = f.read(1)  # skip db number
                     continue
-                # Expiry (seconds)
-                if opcode == b"\xfd":
-                    f.read(4)  # skip 4 bytes
+
+                # Resize DB section
+                elif opcode == b"\xfb":
+                    _read_length_encoding(f)
+                    _read_length_encoding(f)
+                    continue
+
+                # Expiry times
+                elif opcode in (b"\xfd", b"\xfc"):
+                    f.read(4 if opcode == b"\xfd" else 8)
                     opcode = f.read(1)
-                # Expiry (milliseconds)
-                if opcode == b"\xfc":
-                    f.read(8)
-                    opcode = f.read(1)
-                if not opcode:
+                    if not opcode:
+                        break
+
+                # End of RDB
+                elif opcode == b"\xff":
                     break
-                # End of file marker
-                if opcode == b"\xff":
+
+                # Key-value pair (string encoding)
+                elif opcode == b"\x00":
+                    key = _read_string(f)
+                    value = _read_string(f)
+                    if key and value:
+                        data[key] = (value, -1)
+
+                else:
                     break
-                # Simple string object (type 0)
-                # Many RDB variants exist; here we treat anything else as key/value pair if it's string-encoded.
-                # We'll try to interpret opcode bytes as a string length indicator:
-                # In practice the key length encoding appears next; use our _read_length_encoding which reads 1 byte already.
-                # Because we consumed an opcode that may be length-encoded already, we need to 'push back' by seeking back 1 byte
-                f.seek(-1, os.SEEK_CUR)
-                key = _read_string(f)
-                val = _read_string(f)
-                if key:
-                    store[key] = (val, -1)
-    except Exception:
-        # Best-effort loader; do not crash if RDB differs
-        return
+
+    except Exception as e:
+        print(f"Error reading RDB file: {e}")
 
 # ---------------------------
 # In-memory store & conditions
