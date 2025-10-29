@@ -113,7 +113,7 @@ def handle_command(parts: list[str]) -> str:
         return encode_array([])
 
     # ------------------ CONFIG ------------------
-    elif command == "CONFIG":
+    elif command == "CONFIG": #hi
         if len(parts) < 2:
             return encode_error("ERR wrong number of arguments for 'config' command")
         sub = parts[1].upper()
