@@ -245,35 +245,26 @@ def handle_command(parts: list[str]) -> str:
         return encode_bulk_string(value)
 
     # ------------------ BLPOP ------------------
-    elif command == "BLPOP":
-        if len(parts) < 3:
-            return encode_error("ERR wrong number of arguments for 'blpop' command")
-
-        keys = parts[1:-1]  # All arguments except the last one are keys
-        timeout = float(parts[-1])  # Last argument is the timeout
-
-        import time
-        start_time = time.time()
-
-        # Poll for available keys until timeout
-        while True:
-            # Check each key in order
-            for key in keys:
-                if key in store and isinstance(store[key], list) and store[key]:
-                    value = store[key].pop(0)
-                    if not store[key]:  # Remove key if list is now empty
-                        del store[key]
-                    # Return array with key name and value
-                    return encode_array([key, value])
-
-            # Check if timeout has been reached
-            elapsed = time.time() - start_time
-            if elapsed >= timeout:
-                # Return null array on timeout
-                return "*-1\r\n"
-
-            # Sleep briefly before checking again
-            time.sleep(0.01)
+    elif "BLPOP" in command:
+        key = cmd.split(b"\r\n")[4]
+        if len(cmd.split(b"\r\n")) > 6:
+            timeout = float(cmd.split(b"\r\n")[6])
+        else:
+            timeout = 0
+        end_time = time.time() + timeout
+        flag = False
+        lock = threading.Lock()
+        with lock:
+            while time.time() < end_time or timeout == 0:
+                if key in redis_data and len(redis_data[key]) > 0:
+                    value = redis_data[key].pop(0)
+                    conn.send(create_resp_array([key, value], 2))
+                    flag = True
+                    break
+                time.sleep(0.1)
+        if not flag:
+            conn.send(create_resp_array([], -1))
+        return None
 
     # ------------------ KEYS ------------------
     elif command == "KEYS":
