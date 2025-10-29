@@ -150,8 +150,6 @@ def handle_command(cmd):
         return encode_bulk_string(cmd[1] if len(cmd) > 1 else "")
 
     elif op == "SET":
-        if len(cmd) < 3:
-            return b"-ERR wrong number of arguments for 'set'\r\n"
         key, val = cmd[1], cmd[2]
         expiry = -1
         if len(cmd) >= 5 and cmd[3].upper() == "PX":
@@ -194,6 +192,43 @@ def handle_command(cmd):
             store_condition.notify_all()
             return encode_integer(len(lst))
 
+    elif op == "LPOP":
+        key = cmd[1]
+        count = None
+        if len(cmd) > 2:
+            try:
+                count = int(cmd[2])
+            except ValueError:
+                return b"-ERR value is not an integer\r\n"
+
+        v = data_store.get(key)
+        if not v:
+            # Key doesn't exist
+            if count is None:
+                return encode_bulk_string(None)
+            else:
+                return encode_array([])
+
+        lst, expiry = v
+        if not isinstance(lst, list) or not lst:
+            if count is None:
+                return encode_bulk_string(None)
+            else:
+                return encode_array([])
+
+        if count is None:
+            value = lst.pop(0)
+            if not lst:
+                del data_store[key]
+            return encode_bulk_string(value)
+        else:
+            popped = []
+            for _ in range(min(count, len(lst))):
+                popped.append(lst.pop(0))
+            if not lst:
+                del data_store[key]
+            return encode_array(popped)
+
     elif op == "BLPOP":
         keys = cmd[1:-1]
         timeout = float(cmd[-1])
@@ -218,8 +253,6 @@ def handle_command(cmd):
                 store_condition.wait(timeout=remaining)
 
     elif op == "LRANGE":
-        if len(cmd) != 4:
-            return b"-ERR wrong number of arguments for 'lrange'\r\n"
         key = cmd[1]
         start, stop = int(cmd[2]), int(cmd[3])
         if key not in data_store:
