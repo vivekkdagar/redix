@@ -244,6 +244,37 @@ def handle_command(parts: list[str]) -> str:
             del store[key]
         return encode_bulk_string(value)
 
+    # ------------------ BLPOP ------------------
+    elif command == "BLPOP":
+        if len(parts) < 3:
+            return encode_error("ERR wrong number of arguments for 'blpop' command")
+
+        keys = parts[1:-1]  # All arguments except the last one are keys
+        timeout = float(parts[-1])  # Last argument is the timeout
+
+        import time
+        start_time = time.time()
+
+        # Poll for available keys until timeout
+        while True:
+            # Check each key in order
+            for key in keys:
+                if key in store and isinstance(store[key], list) and store[key]:
+                    value = store[key].pop(0)
+                    if not store[key]:  # Remove key if list is now empty
+                        del store[key]
+                    # Return array with key name and value
+                    return encode_array([key, value])
+
+            # Check if timeout has been reached
+            elapsed = time.time() - start_time
+            if elapsed >= timeout:
+                # Return null array on timeout
+                return "*-1\r\n"
+
+            # Sleep briefly before checking again
+            time.sleep(0.01)
+
     # ------------------ KEYS ------------------
     elif command == "KEYS":
         if len(parts) != 2:
