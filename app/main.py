@@ -306,32 +306,45 @@ def handle_command(cmd, conn):
         return encode_array([])
 
     # --- SUBSCRIBE ---
+    # --- SUBSCRIBE ---
     if op == "SUBSCRIBE":
         if len(cmd) < 2:
             return b"-ERR wrong number of arguments for 'subscribe'\r\n"
 
+        # Initialize per-client subscription set
         if conn not in CLIENT_SUBSCRIPTIONS:
             CLIENT_SUBSCRIPTIONS[conn] = set()
 
         for channel in cmd[1:]:
+            # Add channel to global and client maps
             if channel not in CHANNEL_SUBSCRIBERS:
                 CHANNEL_SUBSCRIBERS[channel] = set()
             CHANNEL_SUBSCRIBERS[channel].add(conn)
             CLIENT_SUBSCRIPTIONS[conn].add(channel)
 
             count = len(CLIENT_SUBSCRIPTIONS[conn])
-            msg = (
-                f"*3\r\n"
-                f"${len('subscribe')}\r\nsubscribe\r\n"
-                f"${len(channel)}\r\n{channel}\r\n"
-                f":{count}\r\n"
-            ).encode()
+
+            # Send the subscription acknowledgment
+            msg = b"".join([
+                b"*3\r\n",
+                b"$9\r\nsubscribe\r\n",
+                f"${len(channel)}\r\n{channel}\r\n".encode(),
+                f":{count}\r\n".encode()
+            ])
             conn.sendall(msg)
 
+        # Enter subscribed mode (client waits for messages)
         try:
             while True:
-                time.sleep(1)
+                data = conn.recv(4096)
+                if not data:
+                    break
+                # Redis ignores most commands while in subscribed mode
+                # except PING/UNSUBSCRIBE in later stages
         except Exception:
+            pass
+        finally:
+            # Cleanup on disconnect
             if conn in CLIENT_SUBSCRIPTIONS:
                 for ch in CLIENT_SUBSCRIPTIONS[conn]:
                     CHANNEL_SUBSCRIBERS.get(ch, set()).discard(conn)
