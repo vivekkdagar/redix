@@ -185,6 +185,17 @@ def handle_command(cmd):
 
         # 4. (Full implementation would handle popping an element here)
         return b"*-1\r\n"  # Default to Null Array if no blocking happens or if key is not a list
+    elif op == "RPUSH":
+        key = cmd[1]
+        values = cmd[2:]
+        if key not in data_store:
+            data_store[key] = ([], -1)
+        # If key was not a list, convert it
+        if not isinstance(data_store[key][0], list):
+            data_store[key] = ([], -1)
+        data_store[key][0].extend(values)
+        length = len(data_store[key][0])
+        return f":{length}\r\n".encode()
 
     # --- Fall-through for unhandled commands (optional, usually returns ERR) ---
     else:
