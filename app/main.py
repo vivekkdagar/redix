@@ -30,36 +30,36 @@ def read_key_val_from_db(dir_path, dbfilename, data):
                 if not opcode:
                     break
 
-                # The order is usually: EXPIRY -> TYPE -> KEY -> VALUE
                 if opcode == b'\xfe':  # SELECTDB
                     f.read(1)
+                    current_expiry = -1
                     continue
 
                 elif opcode == b'\xfb':  # RESIZEDB
                     _read_length_encoding(f)
                     _read_length_encoding(f)
+                    current_expiry = -1
                     continue
 
                 elif opcode == b'\xfd':  # EXPIRETIME (seconds)
                     # Expiry is loaded as Unix timestamp (seconds)
                     expiry_sec = struct.unpack("<I", f.read(4))[0]
-                    current_expiry = expiry_sec
+                    current_expiry = float(expiry_sec)  # Store as float
+                    continue
 
                 elif opcode == b'\xfc':  # EXPIRETIME_MS
                     # Expiry is loaded as Unix timestamp (milliseconds)
                     expiry_ms = struct.unpack("<Q", f.read(8))[0]
-                    # Convert to seconds float
-                    current_expiry = expiry_ms / 1000.0
+                    current_expiry = expiry_ms / 1000.0  # Store as float (seconds)
+                    continue
 
-                # If we encounter the TYPE byte (e.g., STRING, LIST, HASH), it means a key-value pair follows.
-                elif opcode == b'\x00':  # STRING (or any other data type)
+                elif opcode == b'\x00':  # STRING (Value Type)
                     key = _read_string(f)
                     value = _read_string(f)
                     if key:
-                        # Store the value and the associated expiry
                         data[key] = (value, current_expiry)
 
-                        # Reset expiry after the key is stored
+                        # Reset expiry context after the key is stored
                     current_expiry = -1
                     continue
 
@@ -67,7 +67,6 @@ def read_key_val_from_db(dir_path, dbfilename, data):
                     break
 
                 else:
-                    # Should handle other data types here, but for now, break if unknown
                     break
 
     except Exception as e:
@@ -90,25 +89,15 @@ def _read_length_encoding(f):
     elif type_bits == 2:
         return struct.unpack(">I", f.read(4))[0]
     else:
-        # Handle 3: Special length encoding (not used for length)
-        # This could be for LZF compression or other encodings, but for length reading, return value bits
         return first & 0x3F
 
 
 def _read_string(f):
     """Decode Redis RDB encoded string."""
     length = _read_length_encoding(f)
-
-    # Check for special encodings (type_bits == 3)
-    # 0, 1, 2 are special integer encodings. 3 is LZF.
-    # For now, just handle the simple length read
-
     if length == 0:
         return ""
-
     val = f.read(length)
-
-    # Simple strings are returned as bytes, but we decode them for the data store
     return val.decode("utf-8", errors="ignore")
 
 
@@ -123,10 +112,8 @@ def encode_simple_string(s):
 def encode_bulk_string(s):
     if s is None:
         return b"$-1\r\n"
-    # Ensure s is a string for len() and formatting
     if isinstance(s, bytes):
         s = s.decode("utf-8", errors="ignore")
-
     return f"${len(s)}\r\n{s}\r\n".encode()
 
 
@@ -137,13 +124,10 @@ def encode_integer(num):
 def encode_array(arr):
     if arr is None:
         return b"*-1\r\n"
-
     resp = f"*{len(arr)}\r\n"
     for el in arr:
-        # Ensure array elements are treated as bulk strings
         if isinstance(el, bytes):
             el = el.decode("utf-8", errors="ignore")
-
         resp += f"${len(el)}\r\n{el}\r\n"
     return resp.encode()
 
@@ -163,8 +147,6 @@ def parse_resp(data):
         idx = 1
         while idx < len(parts) and len(arr) < n:
             if parts[idx].startswith(b"$"):
-                # length = int(parts[idx][1:]) # Length is not strictly needed here
-                # Append the bulk string content, decoded
                 arr.append(parts[idx + 1].decode())
                 idx += 2
             else:
@@ -209,7 +191,6 @@ def handle_client(conn, addr, data_store, dir_path, dbfilename):
                 key = cmd_parts[1]
                 if key in data_store:
                     val, expiry = data_store[key]
-                    # Check for expiration
                     if expiry != -1 and time.time() > expiry:
                         del data_store[key]
                         resp = encode_bulk_string(None)
@@ -219,12 +200,12 @@ def handle_client(conn, addr, data_store, dir_path, dbfilename):
                     resp = encode_bulk_string(None)
 
             elif cmd == "KEYS":
-                # pattern = cmd_parts[1] # Not used for '*' pattern in this simple implementation
+                # pattern = cmd_parts[1]
 
-                # --- FIX START: Filter out expired keys ---
+                # Check and filter out expired keys
                 valid_keys = []
                 current_time = time.time()
-                keys_to_check = list(data_store.keys())  # Iterate over a copy of keys
+                keys_to_check = list(data_store.keys())
 
                 for key in keys_to_check:
                     val, expiry = data_store[key]
@@ -238,7 +219,6 @@ def handle_client(conn, addr, data_store, dir_path, dbfilename):
                         valid_keys.append(key)
 
                 resp = encode_array(valid_keys)
-                # --- FIX END ---
 
             elif cmd == "CONFIG":
                 if len(cmd_parts) >= 3 and cmd_parts[1].upper() == "GET":
