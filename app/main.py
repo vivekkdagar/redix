@@ -67,8 +67,22 @@ def parse_rdb_file(filepath: str):
                 opcode = data[idx]
                 idx += 1
 
+                # 0xFA: Auxiliary field (metadata)
+                if opcode == 0xFA:
+                    # Read key (metadata name)
+                    key_length, bytes_read = read_length_encoded(data, idx)
+                    idx += bytes_read
+                    key = data[idx:idx + key_length].decode('utf-8')
+                    idx += key_length
+                    # Read value (metadata value)
+                    value_length, bytes_read = read_length_encoded(data, idx)
+                    idx += bytes_read
+                    value = data[idx:idx + value_length].decode('utf-8')
+                    idx += value_length
+                    print(f"Auxiliary field: {key} = {value}", flush=True)
+
                 # 0xFE: Database selector
-                if opcode == 0xFE:
+                elif opcode == 0xFE:
                     # Read database number (length-encoded)
                     db_num, bytes_read = read_length_encoded(data, idx)
                     idx += bytes_read
@@ -380,6 +394,6 @@ def main():
         client.sendall(response.encode())
         client.close()
 
-#hi
+
 if __name__ == "__main__":
     main()
