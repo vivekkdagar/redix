@@ -201,26 +201,23 @@ def handle_command(cmd):
 
     # --- FIX 2: Update BLPOP to pop if list is not empty ---
     elif op == "BLPOP":
-        list_key = cmd[1]
-        timeout_sec = float(cmd[2])
+        key = cmd[1]
+        timeout = float(cmd[2])
+        end_time = time.time() + timeout
 
-        # Check if the key exists and holds a non-empty list
-        if list_key in data_store:
-            list_val, expiry = data_store[list_key]
+        # Wait until timeout or list has data
+        while time.time() < end_time:
+            if key in data_store:
+                list_val, expiry = data_store[key]
+                if isinstance(list_val, list) and len(list_val) > 0:
+                    value = list_val.pop(0)
+                    if not list_val:
+                        del data_store[key]
+                    # ✅ Return as RESP array [key, value]
+                    return encode_array([key, value])
+            time.sleep(0.05)
 
-            if isinstance(list_val, list) and list_val:
-                # List is NOT empty, do not block. Pop element from the right (end)
-                element = list_val.pop()
-
-                # If the list becomes empty after pop, remove the key entirely
-                if not list_val:
-                    del data_store[list_key]
-
-                    # Return a two-element array: [key, element]
-                return encode_array([list_key, element])
-
-        # If the list is empty or doesn't exist, proceed with blocking logic
-        time.sleep(timeout_sec)
+        # Timeout — return null array
         return b"*-1\r\n"
 
     elif op == "CONFIG" and len(cmd) >= 3 and cmd[1].upper() == "GET":
