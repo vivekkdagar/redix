@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-# main.py — Redis clone with RDB expiries, lists & basic pub/sub
 import socket
 import threading
 import os
 import time
 import sys
-import struct
 
-# ---------------- In-memory store ----------------
-DATA = {}          # key -> (value_or_list, expiry_timestamp or -1)
+# ---------------- In-memory storage ----------------
+DATA = {}  # key -> (value_or_list, expiry)
 CONFIG = {"dir": ".", "dbfilename": "dump.rdb"}
-CHANNELS = {}      # channel -> list of subscribed connections
+
 STORE_COND = threading.Condition()
+
+# Pub/Sub tracking
+CLIENT_SUBSCRIPTIONS = {}   # conn -> set(channels)
+CHANNEL_SUBSCRIBERS = {}    # channel -> set(conns)
 
 
 # ---------------- RESP helpers ----------------
@@ -36,43 +38,43 @@ def encode_integer(n: int) -> bytes:
 def encode_array(arr) -> bytes:
     if arr is None:
         return b"*-1\r\n"
-    out = [f"*{len(arr)}\r\n".encode()]
-    for x in arr:
-        out.append(encode_bulk(x))
-    return b"".join(out)
+    parts = [f"*{len(arr)}\r\n".encode()]
+    for it in arr:
+        parts.append(encode_bulk(it))
+    return b"".join(parts)
 
 
 def parse_resp_array(data: bytes):
-    if not data.startswith(b"*"):
+    if not data or not data.startswith(b"*"):
         return []
     ptr = 0
     nl = data.find(b"\r\n", ptr)
     if nl == -1:
         return []
     try:
-        n = int(data[1:nl])
-    except:
+        arr_len = int(data[ptr + 1:nl])
+    except Exception:
         return []
     ptr = nl + 2
     out = []
-    for _ in range(n):
-        if data[ptr:ptr+1] != b"$":
+    for _ in range(arr_len):
+        if data[ptr:ptr + 1] != b"$":
             return out
         nl = data.find(b"\r\n", ptr)
         if nl == -1:
             return out
-        length = int(data[ptr+1:nl])
+        blen = int(data[ptr + 1:nl])
         ptr = nl + 2
-        if length == -1:
+        if blen == -1:
             out.append(None)
         else:
-            val = data[ptr:ptr+length].decode(errors="ignore")
-            ptr += length + 2
-            out.append(val)
+            val = data[ptr:ptr + blen]
+            out.append(val.decode("utf-8", errors="ignore"))
+            ptr += blen + 2
     return out
 
 
-# ---------------- RDB parser (with expiries) ----------------
+# ---------------- RDB Parsing (simplified) ----------------
 def _read_length(f):
     b = f.read(1)
     if not b:
@@ -118,55 +120,42 @@ def read_rdb_with_expiry(dir_path, dbfile):
                 if not op:
                     break
                 if op == b'\xfc':  # expiry in ms
-                    b8 = f.read(8)
-                    pending_expiry = int.from_bytes(b8, "little") / 1000.0
-                    continue
-                if op == b'\xfd':  # expiry in s
-                    b4 = f.read(4)
-                    pending_expiry = float(int.from_bytes(b4, "little"))
-                    continue
-                if op == b'\xfe':  # SELECTDB
+                    expiry_ms = int.from_bytes(f.read(8), "little")
+                    pending_expiry = expiry_ms / 1000.0
+                elif op == b'\xfd':  # expiry in s
+                    expiry_s = int.from_bytes(f.read(4), "little")
+                    pending_expiry = float(expiry_s)
+                elif op == b'\xfe':  # SELECTDB
                     _ = _read_length(f)
                     pending_expiry = None
-                    continue
-                if op == b'\xfb':  # RESIZEDB
+                elif op == b'\xfb':  # RESIZEDB
                     _ = _read_length(f)
                     _ = _read_length(f)
                     pending_expiry = None
-                    continue
-                if op == b'\xff':
+                elif op == b'\xff':  # EOF
                     break
-                if op in [b'\x00', b'\x01', b'\x02', b'\x03', b'\x04']:
+                elif op == b'\x00':  # string object
                     key = _read_string(f)
                     val = _read_string(f)
-                    if key:
-                        exp = pending_expiry if pending_expiry else -1
-                        DATA[key] = (val, exp)
+                    if key is not None:
+                        expiry_ts = pending_expiry if pending_expiry else -1
+                        DATA[key] = (val, expiry_ts)
                     pending_expiry = None
     except Exception:
         return
 
 
-# ---------------- Command handlers ----------------
-def _expired(key):
-    v = DATA.get(key)
-    if not v:
-        return True
-    val, exp = v
-    if exp != -1 and time.time() > exp:
-        del DATA[key]
-        return True
-    return False
-
-
-def handle_command(cmd, conn=None):
+# ---------------- Command Handling ----------------
+def handle_command(cmd, conn):
     if not cmd:
         return b""
     op = cmd[0].upper()
 
     # --- PING ---
     if op == "PING":
-        return encode_simple("PONG") if len(cmd) == 1 else encode_bulk(cmd[1])
+        if len(cmd) == 1:
+            return encode_simple("PONG")
+        return encode_bulk(cmd[1])
 
     # --- ECHO ---
     if op == "ECHO":
@@ -181,8 +170,8 @@ def handle_command(cmd, conn=None):
         if len(cmd) >= 5 and cmd[3].upper() == "PX":
             try:
                 expiry = time.time() + int(cmd[4]) / 1000.0
-            except:
-                pass
+            except Exception:
+                expiry = -1
         DATA[key] = (val, expiry)
         return encode_simple("OK")
 
@@ -191,72 +180,91 @@ def handle_command(cmd, conn=None):
         if len(cmd) < 2:
             return b"-ERR wrong number of arguments for 'get'\r\n"
         key = cmd[1]
-        if _expired(key):
+        v = DATA.get(key)
+        if v is None:
             return encode_bulk(None)
-        val, _ = DATA[key]
-        return encode_bulk(val if not isinstance(val, list) else None)
+        val, exp = v
+        if exp != -1 and time.time() > exp:
+            del DATA[key]
+            return encode_bulk(None)
+        if isinstance(val, list):
+            return encode_bulk(None)
+        return encode_bulk(val)
 
-    # --- Lists: LPUSH / RPUSH / LPOP / BLPOP / LRANGE / LLEN ---
+    # --- LPUSH / RPUSH ---
     if op in ("LPUSH", "RPUSH"):
-        key, elems = cmd[1], cmd[2:]
+        if len(cmd) < 3:
+            return b"-ERR wrong number of arguments\r\n"
+        key, *elems = cmd[1:]
         with STORE_COND:
             if key not in DATA or not isinstance(DATA[key][0], list):
                 DATA[key] = ([], -1)
-            lst, exp = DATA[key]
+            lst, expiry = DATA[key]
             if op == "LPUSH":
                 for e in elems:
                     lst.insert(0, e)
             else:
-                lst.extend(elems)
+                for e in elems:
+                    lst.append(e)
             STORE_COND.notify_all()
             return encode_integer(len(lst))
 
+    # --- LPOP ---
     if op == "LPOP":
         key = cmd[1]
-        count = int(cmd[2]) if len(cmd) > 2 else None
+        count = None
+        if len(cmd) > 2:
+            try:
+                count = int(cmd[2])
+            except Exception:
+                return b"-ERR value is not an integer\r\n"
         v = DATA.get(key)
-        if not v or not isinstance(v[0], list):
+        if not v or not isinstance(v[0], list) or len(v[0]) == 0:
             return encode_bulk(None) if count is None else encode_array([])
-        lst, exp = v
-        if not lst:
-            return encode_bulk(None) if count is None else encode_array([])
+        lst, expiry = v
         if count is None:
             val = lst.pop(0)
             if not lst:
                 del DATA[key]
             return encode_bulk(val)
-        popped = [lst.pop(0) for _ in range(min(count, len(lst)))]
+        popped = []
+        for _ in range(min(count, len(lst))):
+            popped.append(lst.pop(0))
         if not lst:
             del DATA[key]
         return encode_array(popped)
 
+    # --- BLPOP ---
     if op == "BLPOP":
-        keys, timeout = cmd[1:-1], float(cmd[-1])
-        end_time = None if timeout == 0 else time.time() + timeout
+        keys = cmd[1:-1]
+        timeout = float(cmd[-1])
+        end_time = time.time() + timeout if timeout > 0 else None
         with STORE_COND:
             while True:
                 for k in keys:
                     v = DATA.get(k)
                     if v and isinstance(v[0], list) and v[0]:
-                        lst, _ = v
+                        lst, expiry = v
                         val = lst.pop(0)
                         if not lst:
                             del DATA[k]
                         return encode_array([k, val])
                 if timeout == 0:
                     STORE_COND.wait()
-                else:
-                    remain = end_time - time.time()
-                    if remain <= 0:
-                        return b"*-1\r\n"
-                    STORE_COND.wait(timeout=remain)
+                    continue
+                remaining = end_time - time.time()
+                if remaining <= 0:
+                    return b"*-1\r\n"
+                STORE_COND.wait(timeout=remaining)
 
+    # --- LRANGE ---
     if op == "LRANGE":
-        key, start, stop = cmd[1], int(cmd[2]), int(cmd[3])
+        key = cmd[1]
+        start, stop = int(cmd[2]), int(cmd[3])
         v = DATA.get(key)
         if not v or not isinstance(v[0], list):
             return encode_array([])
-        lst = v[0]
+        lst, expiry = v
         n = len(lst)
         if start < 0:
             start = n + start
@@ -264,12 +272,17 @@ def handle_command(cmd, conn=None):
             stop = n + stop
         start = max(start, 0)
         stop = min(stop, n - 1)
-        return encode_array(lst[start:stop+1] if start <= stop else [])
+        if start > stop:
+            return encode_array([])
+        return encode_array(lst[start:stop + 1])
 
+    # --- LLEN ---
     if op == "LLEN":
         key = cmd[1]
         v = DATA.get(key)
-        return encode_integer(len(v[0]) if v and isinstance(v[0], list) else 0)
+        if not v or not isinstance(v[0], list):
+            return encode_integer(0)
+        return encode_integer(len(v[0]))
 
     # --- CONFIG GET ---
     if op == "CONFIG" and len(cmd) >= 3 and cmd[1].upper() == "GET":
@@ -278,10 +291,8 @@ def handle_command(cmd, conn=None):
             return encode_array([key, CONFIG[key]])
         return encode_array([])
 
-    # --- KEYS * ---
+    # --- KEYS ---
     if op == "KEYS":
-        if len(cmd) != 2:
-            return b"-ERR wrong number of arguments for 'keys'\r\n"
         pattern = cmd[1]
         if pattern == "*":
             now = time.time()
@@ -294,41 +305,37 @@ def handle_command(cmd, conn=None):
             return encode_array(keys)
         return encode_array([])
 
-    # --- SUBSCRIBE channel ---
-    # --- SUBSCRIBE channel ---
-    # --- SUBSCRIBE channel ---
-    # --- SUBSCRIBE channel [channel ...] ---
+    # --- SUBSCRIBE ---
     if op == "SUBSCRIBE":
         if len(cmd) < 2:
             return b"-ERR wrong number of arguments for 'subscribe'\r\n"
 
-        # Initialize this client's subscription set
-        subs = CLIENT_SUBSCRIPTIONS.setdefault(conn, set())
+        if conn not in CLIENT_SUBSCRIPTIONS:
+            CLIENT_SUBSCRIPTIONS[conn] = set()
 
-        responses = []
         for channel in cmd[1:]:
-            # Add client to the channel
-            CHANNEL_SUBSCRIBERS.setdefault(channel, set()).add(conn)
+            if channel not in CHANNEL_SUBSCRIBERS:
+                CHANNEL_SUBSCRIBERS[channel] = set()
+            CHANNEL_SUBSCRIBERS[channel].add(conn)
+            CLIENT_SUBSCRIPTIONS[conn].add(channel)
 
-            # Add channel to client’s subscriptions (set prevents duplicates)
-            subs.add(channel)
+            count = len(CLIENT_SUBSCRIPTIONS[conn])
+            msg = (
+                f"*3\r\n"
+                f"${len('subscribe')}\r\nsubscribe\r\n"
+                f"${len(channel)}\r\n{channel}\r\n"
+                f":{count}\r\n"
+            ).encode()
+            conn.sendall(msg)
 
-            # Build per-channel response: ["subscribe", channel, count]
-            count = len(subs)
-            resp = b"*3\r\n" + encode_bulk("subscribe") + encode_bulk(channel) + encode_integer(count)
-            responses.append(resp)
-
-        # Send all responses one after another (one per channel)
-        for r in responses:
-            conn.sendall(r)
-
-        # Enter subscribed mode (infinite loop)
         try:
             while True:
                 time.sleep(1)
         except Exception:
-            # Client disconnected
-            pass
+            if conn in CLIENT_SUBSCRIPTIONS:
+                for ch in CLIENT_SUBSCRIPTIONS[conn]:
+                    CHANNEL_SUBSCRIBERS.get(ch, set()).discard(conn)
+                del CLIENT_SUBSCRIPTIONS[conn]
         return b""
 
     return b"-ERR unknown command\r\n"
@@ -352,7 +359,7 @@ def handle_client(conn):
     finally:
         try:
             conn.close()
-        except:
+        except Exception:
             pass
 
 
@@ -365,9 +372,9 @@ def main():
 
     read_rdb_with_expiry(CONFIG["dir"], CONFIG["dbfilename"])
 
-    print("Server started on 0.0.0.0:6379")
     server = socket.create_server(("0.0.0.0", 6379), reuse_port=True)
-    server.listen(64)
+    print("Server started on 0.0.0.0:6379")
+
     while True:
         conn, _ = server.accept()
         threading.Thread(target=handle_client, args=(conn,), daemon=True).start()
