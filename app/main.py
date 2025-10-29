@@ -655,30 +655,38 @@ def cmd_executor(decoded_data, connection, config, queued, executing):
         connection.sendall(error_encoder("ERR wrong number of arguments for 'set'"))
         return (b"", queued)
 
-    if cmd == "GET" and len(decoded_data) >= 2:
-        key = decoded_data[1]
-        value = None
+    if cmd == "GET":
+        if len(decoded_data) >= 2:
+            key = decoded_data[1]
+            print("role", config["role"])
+            val = None
 
-        # Check in-memory store first, then RDB-loaded store
-        if key in store:
-            value = store[key]
-        elif 'store' in config and key in config['store']:
-            val_entry = config['store'][key]
-            if isinstance(val_entry, tuple):
-                value = val_entry[0]
+            # 1️⃣ Prefer runtime store (normal SETs)
+            if key in store:
+                val = store[key]
+            # 2️⃣ Else fallback to RDB-loaded store (from config)
+            elif "store" in config and key in config["store"]:
+                val = config["store"][key]
+
+            # 3️⃣ Extract real string if (value, expiry)
+            if val is not None:
+                if isinstance(val, tuple):
+                    val = val[0]
+                if isinstance(val, str):
+                    value_bytes = val.encode()
+                else:
+                    value_bytes = str(val).encode()
+                response = b"$" + str(len(value_bytes)).encode() + b"\r\n" + value_bytes + b"\r\n"
+                print(f"GET response: {response}")
+                connection.sendall(response)
             else:
-                value = val_entry
+                # 4️⃣ Null bulk string for missing key
+                connection.sendall(b"$-1\r\n")
 
-        if value is not None:
-            if isinstance(value, tuple):
-                value = value[0]
-            value_bytes = str(value).encode()
-            response = b"$" + str(len(value_bytes)).encode() + b"\r\n" + value_bytes + b"\r\n"
-            connection.sendall(response)
-        else:
-            # Null bulk string for missing key
-            connection.sendall(b"$-1\r\n")
-        return b"", queued
+            return (b"", queued)
+
+        connection.sendall(error_encoder("ERR wrong number of arguments for 'get'"))
+        return (b"", queued)
 
     # Lists
     if cmd == "RPUSH":
