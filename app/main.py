@@ -165,26 +165,25 @@ def handle_command(cmd):
 
     # --- FIX: Handle BLPOP command ---
     elif op == "BLPOP":
-        # BLPOP key timeout
-        # For an empty list and a timeout, Redis must return a Null Array ("*-1\r\n")
+        key = cmd[1]
+        timeout = float(cmd[2]) if len(cmd) > 2 else 0
+        start_time = time.time()
+        value = None
 
-        # 1. Get list key and timeout
-        list_key = cmd[1]
-        timeout_sec = float(cmd[2])
+        # Wait until timeout or value found
+        while time.time() - start_time < timeout:
+            if key in data_store and isinstance(data_store[key][0], list) and len(data_store[key][0]) > 0:
+                value = data_store[key][0].pop(0)
+                break
+            await asyncio.sleep(0.05)
 
-        # 2. Check if the key exists and has elements (simplified: assume it's always empty for this test)
-        is_list_empty = True
-        if list_key in data_store and isinstance(data_store[list_key][0], list) and data_store[list_key][0]:
-            is_list_empty = False
-
-        # 3. If the list is empty, simulate blocking and return Null Array
-        if is_list_empty:
-            # Simulate the blocking time
-            time.sleep(timeout_sec)
+        if value is not None:
+            # ✅ Redis expects [key, value]
+            resp = f"*2\r\n${len(key)}\r\n{key}\r\n${len(value)}\r\n{value}\r\n"
+            return resp.encode()
+        else:
+            # ✅ Timeout case: null array
             return b"*-1\r\n"
-
-        # 4. (Full implementation would handle popping an element here)
-        return b"*-1\r\n"  # Default to Null Array if no blocking happens or if key is not a list
     elif op == "RPUSH":
         key = cmd[1]
         values = cmd[2:]
