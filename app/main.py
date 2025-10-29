@@ -248,7 +248,7 @@ def handle_command(parts: list[str]) -> str:
     elif "BLPOP" in command:
         key = cmd.split(b"\r\n")[4]
         if len(cmd.split(b"\r\n")) > 6:
-            timeout = float(cmd.split(b"\r\n")[6])
+            timeout = float(command.split(b"\r\n")[6])
         else:
             timeout = 0
         end_time = time.time() + timeout
