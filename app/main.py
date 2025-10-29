@@ -40,107 +40,78 @@ def parse_rdb_file(filepath: str):
     try:
         if not os.path.exists(filepath):
             print(f"RDB file not found: {filepath}", flush=True)
-            sys.stderr.write(f"RDB file not found: {filepath}\n")
-            sys.stderr.flush()
             return
 
         with open(filepath, "rb") as f:
-            data = f.read()
-            print(f"RDB file size: {len(data)} bytes", flush=True)
-            sys.stderr.write(f"RDB file size: {len(data)} bytes\n")
-            sys.stderr.flush()
-            # Print first 100 bytes as hex for debugging
-            hex_dump = ' '.join(f'{b:02x}' for b in data[:100])
-            print(f"First 100 bytes (hex): {hex_dump}", flush=True)
-            sys.stderr.write(f"First 100 bytes (hex): {hex_dump}\n")
-            sys.stderr.flush()
+            print(f"Reading RDB file: {filepath}", flush=True)
 
-            # Parse RDB file
-            # Magic string "REDIS" + version (4 bytes)
-            if data[:5] != b"REDIS":
-                print("Invalid RDB file: missing REDIS header", flush=True)
-                return
-
-            idx = 9  # Skip header (REDIS + 4 byte version)
-
-            while idx < len(data):
-                opcode = data[idx]
-                idx += 1
-
-                # 0xFA: Auxiliary field (metadata)
-                if opcode == 0xFA:
-                    # Read key (metadata name)
-                    key_length, bytes_read = read_length_encoded(data, idx)
-                    idx += bytes_read
-                    key = data[idx:idx + key_length].decode('utf-8')
-                    idx += key_length
-                    # Read value (metadata value)
-                    value_length, bytes_read = read_length_encoded(data, idx)
-                    idx += bytes_read
-                    value = data[idx:idx + value_length].decode('utf-8')
-                    idx += value_length
-                    print(f"Auxiliary field: {key} = {value}", flush=True)
-
-                # 0xFE: Database selector
-                elif opcode == 0xFE:
-                    # Read database number (length-encoded)
-                    db_num, bytes_read = read_length_encoded(data, idx)
-                    idx += bytes_read
-                    print(f"Database: {db_num}", flush=True)
-
-                # 0xFB: Hash table size info
-                elif opcode == 0xFB:
-                    hash_table_size, bytes_read = read_length_encoded(data, idx)
-                    idx += bytes_read
-                    expire_hash_size, bytes_read = read_length_encoded(data, idx)
-                    idx += bytes_read
-                    print(f"Hash table size: {hash_table_size}, Expire hash size: {expire_hash_size}", flush=True)
-
-                # 0xFD: Expiry time in seconds
-                elif opcode == 0xFD:
-                    # Skip 4 bytes of expiry time for now
-                    idx += 4
-                    # Read the key-value pair after expiry
-                    value_type = data[idx]
-                    idx += 1
-                    key, value, bytes_read = read_key_value_pair(data, idx, value_type)
-                    idx += bytes_read
-                    if key:
-                        store[key] = value
-                        print(f"Loaded key with expiry: {key} = {value}", flush=True)
-
-                # 0xFC: Expiry time in milliseconds
-                elif opcode == 0xFC:
-                    # Skip 8 bytes of expiry time for now
-                    idx += 8
-                    # Read the key-value pair after expiry
-                    value_type = data[idx]
-                    idx += 1
-                    key, value, bytes_read = read_key_value_pair(data, idx, value_type)
-                    idx += bytes_read
-                    if key:
-                        store[key] = value
-                        print(f"Loaded key with expiry (ms): {key} = {value}", flush=True)
-
-                # 0xFF: End of file
-                elif opcode == 0xFF:
-                    print("Reached end of RDB file", flush=True)
+            # Read until we find 0xFB (hash table size info)
+            while True:
+                operand = f.read(1)
+                if not operand:
+                    print("Reached end of file before finding 0xFB", flush=True)
+                    return
+                if operand == b"\xfb":
+                    print("Found 0xFB opcode", flush=True)
                     break
 
-                # 0x00: String encoding
-                elif opcode == 0x00:
-                    key, value, bytes_read = read_key_value_pair(data, idx, opcode)
-                    idx += bytes_read
-                    if key:
-                        store[key] = value
-                        print(f"Loaded key: {key} = {value}", flush=True)
+            # Read number of keys
+            num_keys = int.from_bytes(f.read(1), byteorder="little")
+            f.read(1)  # Skip expire hash table size
+            print(f"Number of keys: {num_keys}", flush=True)
 
+            # Read each key-value pair
+            for i in range(num_keys):
+                expired = False
+                print(f"Reading key {i + 1}/{num_keys}", flush=True)
+
+                # Check for expiry
+                top = f.read(1)
+                if top == b"\xfc":  # Expiry in milliseconds
+                    milli_time = int.from_bytes(f.read(8), byteorder="little")
+                    import time
+                    now = time.time() * 1000
+                    if milli_time < now:
+                        expired = True
+                        print(f"Key expired (ms): {milli_time} < {now}", flush=True)
+                    f.read(1)  # Skip value type
+                elif top == b"\xfd":  # Expiry in seconds
+                    sec_time = int.from_bytes(f.read(4), byteorder="little")
+                    import time
+                    if sec_time < time.time():
+                        expired = True
+                        print(f"Key expired (s)", flush=True)
+                    f.read(1)  # Skip value type
+
+                # Read key length and key
+                length = int.from_bytes(f.read(1), byteorder="little")
+                if (length >> 6) == 0b00:
+                    length = length & 0b00111111
                 else:
-                    print(f"Unknown opcode: 0x{opcode:02x} at position {idx - 1}", flush=True)
-                    break
+                    length = 0
+                key = f.read(length).decode('utf-8')
+                print(f"Key: {key}", flush=True)
+
+                # Read value length and value
+                length = int.from_bytes(f.read(1), byteorder="little")
+                if (length >> 6) == 0b00:
+                    length = length & 0b00111111
+                else:
+                    length = 0
+                value = f.read(length).decode('utf-8')
+                print(f"Value: {value}", flush=True)
+
+                # Store if not expired
+                if not expired:
+                    store[key] = value
+                    print(f"Stored: {key} = {value}", flush=True)
+                else:
+                    print(f"Skipped expired key: {key}", flush=True)
 
     except Exception as e:
         print(f"Error parsing RDB file: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
 
 
 def read_length_encoded(data: bytes, idx: int):
