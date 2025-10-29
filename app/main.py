@@ -89,7 +89,11 @@ def handle_command(parts: list[str]) -> str:
         key = parts[1]
         if key not in store or not store[key]:
             return "$-1\r\n"
+        if not isinstance(store[key], list):
+            return encode_error("WRONGTYPE Operation against a key holding the wrong kind of value")
         value = store[key].pop(0)
+        if not store[key]:  # Remove key if list is now empty
+            del store[key]
         return encode_bulk_string(value)
 
     # ------------------ RPOP ------------------
@@ -99,7 +103,11 @@ def handle_command(parts: list[str]) -> str:
         key = parts[1]
         if key not in store or not store[key]:
             return "$-1\r\n"
+        if not isinstance(store[key], list):
+            return encode_error("WRONGTYPE Operation against a key holding the wrong kind of value")
         value = store[key].pop()
+        if not store[key]:  # Remove key if list is now empty
+            del store[key]
         return encode_bulk_string(value)
 
     # ------------------ KEYS ------------------
@@ -108,12 +116,13 @@ def handle_command(parts: list[str]) -> str:
             return encode_error("ERR wrong number of arguments for 'keys' command")
         pattern = parts[1]
         if pattern == "*":
+            # Return all keys, regardless of type
             return encode_array(list(store.keys()))
         # (No advanced pattern matching needed for Codecrafters)
         return encode_array([])
 
     # ------------------ CONFIG ------------------
-    elif command == "CONFIG": #hi
+    elif command == "CONFIG":
         if len(parts) < 2:
             return encode_error("ERR wrong number of arguments for 'config' command")
         sub = parts[1].upper()
