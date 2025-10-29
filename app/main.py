@@ -264,6 +264,9 @@ def handle_command(parts: list[str]) -> str:
         if len(parts) != 2:
             return encode_error("ERR wrong number of arguments for 'keys' command")
         pattern = parts[1]
+        print(f"KEYS command - pattern: {pattern}, store keys: {list(store.keys())}", flush=True)
+        print(f"KEYS command - config: {config}", flush=True)
+        print(f"KEYS command - sys.argv: {sys.argv}", flush=True)
         if pattern == "*":
             # Return all keys, regardless of type
             return encode_array(list(store.keys()))
