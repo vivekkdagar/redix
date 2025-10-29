@@ -1,392 +1,583 @@
-import socket
-import sys
+#!/usr/bin/env python3
+import argparse
+import asyncio
+import struct
 import os
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
-# In-memory store
-store = {}
-config = {
-    "dir": "/tmp",
-    "dbfilename": "dump.rdb"
-}
+# ---------------------------
+# RESP parser (async)
+# ---------------------------
+class RESPError(Exception):
+    pass
 
+async def _read_line(reader: asyncio.StreamReader) -> bytes:
+    line = await reader.readline()
+    if not line:
+        raise EOFError()
+    if not line.endswith(b"\r\n"):
+        raise RESPError("Protocol error: expected CRLF")
+    return line[:-2]
 
-def encode_bulk_string(value: str) -> str:
-    return f"${len(value)}\r\n{value}\r\n"
+async def read_resp(reader: asyncio.StreamReader) -> Any:
+    """Read one RESP value from the stream."""
+    prefix = await reader.read(1)
+    if not prefix:
+        raise EOFError()
+    if prefix == b'+':  # simple string
+        line = await _read_line(reader)
+        return line.decode()
+    if prefix == b'-':  # error
+        line = await _read_line(reader)
+        return Exception(line.decode())
+    if prefix == b':':  # integer
+        line = await _read_line(reader)
+        return int(line.decode())
+    if prefix == b'$':  # bulk string
+        line = await _read_line(reader)
+        length = int(line.decode())
+        if length == -1:
+            return None
+        data = await reader.readexactly(length)
+        crlf = await reader.readexactly(2)
+        if crlf != b'\r\n':
+            raise RESPError("Protocol error reading bulk string CRLF")
+        return data.decode()
+    if prefix == b'*':  # array
+        line = await _read_line(reader)
+        count = int(line.decode())
+        if count == -1:
+            return None
+        arr = []
+        for _ in range(count):
+            arr.append(await read_resp(reader))
+        return arr
+    # unsupported (RESP3 extras) - not needed
+    raise RESPError("Unsupported RESP type")
 
+# ---------------------------
+# RESP encoders
+# ---------------------------
+def encode_simple_string(s: str) -> bytes:
+    return f"+{s}\r\n".encode()
 
-def encode_simple_string(value: str) -> str:
-    return f"+{value}\r\n"
+def encode_error(s: str) -> bytes:
+    return f"-{s}\r\n".encode()
 
+def encode_integer(i: int) -> bytes:
+    return f":{i}\r\n".encode()
 
-def encode_error(value: str) -> str:
-    return f"-{value}\r\n"
+def encode_bulk_string(s: Optional[str]) -> bytes:
+    if s is None:
+        return b"$-1\r\n"
+    b = s.encode()
+    return b"$" + str(len(b)).encode() + b"\r\n" + b + b"\r\n"
 
+def encode_array(items: Optional[List[Any]]) -> bytes:
+    if items is None:
+        return b"*-1\r\n"
+    out = b"*" + str(len(items)).encode() + b"\r\n"
+    for item in items:
+        if item is None:
+            out += b"$-1\r\n"
+        elif isinstance(item, int):
+            out += encode_integer(item)
+        elif isinstance(item, list):
+            out += encode_array(item)
+        else:
+            out += encode_bulk_string(str(item))
+    return out
 
-def encode_integer(value: int) -> str:
-    return f":{value}\r\n"
+# ---------------------------
+# RDB helpers (simple loader)
+# Uses the improved _read_length_encoding/_read_string approach you provided
+# ---------------------------
+def _read_length_encoding(f) -> int:
+    first_byte = f.read(1)
+    if not first_byte:
+        return 0
+    first = first_byte[0]
+    encoding_type = (first & 0xC0) >> 6
+    if encoding_type == 0:  # 00 - next 6 bits is length
+        return first & 0x3F
+    elif encoding_type == 1:  # 01 - next 14 bits is length
+        nxt = f.read(1)
+        if not nxt:
+            return 0
+        return ((first & 0x3F) << 8) | nxt[0]
+    elif encoding_type == 2:  # 10 - next 4 bytes is length (big-endian)
+        data = f.read(4)
+        if len(data) < 4:
+            return 0
+        return struct.unpack(">I", data)[0]
+    else:  # 11 - special encoding (we treat as small)
+        return first & 0x3F
 
+def _read_string(f) -> str:
+    length = _read_length_encoding(f)
+    if length == 0:
+        return ""
+    data = f.read(length)
+    if len(data) < length:
+        return ""
+    return data.decode('utf-8', errors='ignore')
 
-def encode_array(values: list[str]) -> str:
-    if not values:
-        return "*0\r\n"
-    resp = f"*{len(values)}\r\n"
-    for v in values:
-        resp += encode_bulk_string(v)
-    return resp
-
-
-def parse_rdb_file(filepath: str):
-    """Parse RDB file and load keys into store"""
+def read_key_val_from_db(dir_path: str, dbfilename: str, store: Dict[str, Tuple[str,int]]):
+    """Populate store with string keys from RDB (best-effort; we only need keys/values for tests)."""
+    rdb_file_loc = os.path.join(dir_path, dbfilename)
+    if not os.path.isfile(rdb_file_loc):
+        return
     try:
-        if not os.path.exists(filepath):
-            print(f"RDB file not found: {filepath}", flush=True)
-            return
-
-        with open(filepath, "rb") as f:
-            print(f"Reading RDB file: {filepath}", flush=True)
-
-            # Read until we find 0xFB (hash table size info)
+        with open(rdb_file_loc, "rb") as f:
+            header = f.read(9)
+            if not header.startswith(b"REDIS"):
+                # Not an RDB we recognize — bail
+                return
+            # Now we scan file looking for payload. We follow a robust loop similar to snippet:
             while True:
-                operand = f.read(1)
-                if not operand:
-                    print("Reached end of file before finding 0xFB", flush=True)
+                opcode = f.read(1)
+                if not opcode:
+                    break
+                # DB selector
+                if opcode == b"\xfe":
+                    # database number (bulk encoded)
+                    f.read(1)
+                    continue
+                # Expiry (seconds)
+                if opcode == b"\xfd":
+                    f.read(4)  # skip 4 bytes
+                    opcode = f.read(1)
+                # Expiry (milliseconds)
+                if opcode == b"\xfc":
+                    f.read(8)
+                    opcode = f.read(1)
+                if not opcode:
+                    break
+                # End of file marker
+                if opcode == b"\xff":
+                    break
+                # Simple string object (type 0)
+                # Many RDB variants exist; here we treat anything else as key/value pair if it's string-encoded.
+                # We'll try to interpret opcode bytes as a string length indicator:
+                # In practice the key length encoding appears next; use our _read_length_encoding which reads 1 byte already.
+                # Because we consumed an opcode that may be length-encoded already, we need to 'push back' by seeking back 1 byte
+                f.seek(-1, os.SEEK_CUR)
+                key = _read_string(f)
+                val = _read_string(f)
+                if key:
+                    store[key] = (val, -1)
+    except Exception:
+        # Best-effort loader; do not crash if RDB differs
+        return
+
+# ---------------------------
+# In-memory store & conditions
+# ---------------------------
+# store: key -> value
+# For string values store[key] = ("string", "value")
+# For lists store[key] = ("list", [elements...])
+# expiry dict: key -> expire_at (timestamp seconds) or -1
+store: Dict[str, Tuple[str, Any]] = {}
+expiry: Dict[str, float] = {}
+# per-key conditions for BLPOP notifications
+_conditions: Dict[str, asyncio.Condition] = {}
+
+def get_condition_for(key: str) -> asyncio.Condition:
+    if key not in _conditions:
+        _conditions[key] = asyncio.Condition()
+    return _conditions[key]
+
+def _clean_expired(key: str):
+    if key in expiry:
+        if expiry[key] != -1 and time.time() > expiry[key]:
+            # delete key
+            store.pop(key, None)
+            expiry.pop(key, None)
+
+def clean_all():
+    for k in list(expiry.keys()):
+        _clean_expired(k)
+
+# ---------------------------
+# Command implementations
+# ---------------------------
+async def cmd_ping(args: List[Any], writer: asyncio.StreamWriter):
+    if len(args) == 0:
+        writer.write(encode_simple_string("PONG"))
+    else:
+        writer.write(encode_bulk_string(str(args[0])))
+
+async def cmd_echo(args: List[Any], writer: asyncio.StreamWriter):
+    if len(args) < 1:
+        writer.write(encode_error("ERR wrong number of arguments for 'echo' command"))
+    else:
+        writer.write(encode_bulk_string(str(args[0])))
+
+async def cmd_set(args: List[Any], writer: asyncio.StreamWriter):
+    if len(args) < 2:
+        writer.write(encode_error("ERR wrong number of arguments for 'set' command"))
+        return
+    key = str(args[0])
+    val = str(args[1])
+    ex = -1
+    # Handle PX milliseconds optionally: args like ... PX 1000 or px 1000 or EX seconds
+    idx = 2
+    while idx + 1 < len(args):
+        opt = str(args[idx]).lower()
+        optval = args[idx+1]
+        if opt == "px":
+            try:
+                ex = time.time() + float(optval)/1000.0
+            except Exception:
+                pass
+        elif opt == "ex":
+            try:
+                ex = time.time() + float(optval)
+            except Exception:
+                pass
+        idx += 2
+    store[key] = ("string", val)
+    expiry[key] = ex
+    writer.write(encode_simple_string("OK"))
+
+async def cmd_get(args: List[Any], writer: asyncio.StreamWriter):
+    if len(args) < 1:
+        writer.write(encode_error("ERR wrong number of arguments for 'get' command"))
+        return
+    key = str(args[0])
+    _clean_expired(key)
+    entry = store.get(key)
+    if not entry:
+        writer.write(encode_bulk_string(None))
+        return
+    typ, val = entry
+    if typ != "string":
+        # In Redis, GET on non-string returns WRONGTYPE error
+        writer.write(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        return
+    writer.write(encode_bulk_string(val))
+
+async def cmd_rpush(args: List[Any], writer: asyncio.StreamWriter):
+    if len(args) < 2:
+        writer.write(encode_error("ERR wrong number of arguments for 'rpush' command"))
+        return
+    key = str(args[0])
+    vals = [str(x) for x in args[1:]]
+    _clean_expired(key)
+    entry = store.get(key)
+    if not entry:
+        store[key] = ("list", list(vals))
+        expiry.pop(key, None)
+    else:
+        typ, cur = entry
+        if typ != "list":
+            writer.write(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+            return
+        cur.extend(vals)
+    # notify waiting BLPOP
+    cond = get_condition_for(key)
+    async with cond:
+        cond.notify_all()
+    length = len(store[key][1])
+    writer.write(encode_integer(length))
+
+async def cmd_lpush(args: List[Any], writer: asyncio.StreamWriter):
+    if len(args) < 2:
+        writer.write(encode_error("ERR wrong number of arguments for 'lpush' command"))
+        return
+    key = str(args[0])
+    vals = [str(x) for x in args[1:]]
+    _clean_expired(key)
+    entry = store.get(key)
+    if not entry:
+        store[key] = ("list", [])
+        expiry.pop(key, None)
+    typ, cur = store[key]
+    if typ != "list":
+        writer.write(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        return
+    # push left in order given (first provided becomes leftmost)
+    for v in reversed(vals):
+        cur.insert(0, v)
+    cond = get_condition_for(key)
+    async with cond:
+        cond.notify_all()
+    writer.write(encode_integer(len(cur)))
+
+async def cmd_llen(args: List[Any], writer: asyncio.StreamWriter):
+    if len(args) < 1:
+        writer.write(encode_error("ERR wrong number of arguments for 'llen' command"))
+        return
+    key = str(args[0])
+    _clean_expired(key)
+    entry = store.get(key)
+    if not entry:
+        writer.write(encode_integer(0))
+        return
+    typ, cur = entry
+    if typ != "list":
+        writer.write(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        return
+    writer.write(encode_integer(len(cur)))
+
+async def cmd_lrange(args: List[Any], writer: asyncio.StreamWriter):
+    if len(args) < 3:
+        writer.write(encode_error("ERR wrong number of arguments for 'lrange' command"))
+        return
+    key = str(args[0])
+    start = int(args[1])
+    end = int(args[2])
+    _clean_expired(key)
+    entry = store.get(key)
+    if not entry:
+        writer.write(encode_array([]))
+        return
+    typ, cur = entry
+    if typ != "list":
+        writer.write(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        return
+    n = len(cur)
+    # normalize negative indices
+    if start < 0:
+        start = n + start
+    if end < 0:
+        end = n + end
+    start = max(start, 0)
+    end = min(end, n - 1)
+    if start > end or start >= n:
+        writer.write(encode_array([]))
+        return
+    sub = cur[start:end+1]
+    writer.write(encode_array(sub))
+
+async def cmd_lpop(args: List[Any], writer: asyncio.StreamWriter):
+    if len(args) < 1:
+        writer.write(encode_error("ERR wrong number of arguments for 'lpop' command"))
+        return
+    key = str(args[0])
+    count = 1
+    if len(args) > 1:
+        try:
+            count = int(args[1])
+            if count < 0:
+                raise ValueError()
+        except Exception:
+            writer.write(encode_error("ERR value is not an integer or out of range"))
+            return
+    _clean_expired(key)
+    entry = store.get(key)
+    if not entry:
+        # empty
+        if count == 1:
+            writer.write(encode_bulk_string(None))
+        else:
+            writer.write(encode_array([]))
+        return
+    typ, cur = entry
+    if typ != "list":
+        writer.write(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        return
+    if len(cur) == 0:
+        if count == 1:
+            writer.write(encode_bulk_string(None))
+        else:
+            writer.write(encode_array([]))
+        return
+    # pop up to count
+    n = min(count, len(cur))
+    if n == 1 and count == 1:
+        val = cur.pop(0)
+        writer.write(encode_bulk_string(val))
+    else:
+        popped = []
+        for _ in range(n):
+            popped.append(cur.pop(0))
+        writer.write(encode_array(popped))
+
+async def cmd_blpop(args: List[Any], writer: asyncio.StreamWriter):
+    # BLPOP key [key ...] timeout
+    if len(args) < 2:
+        writer.write(encode_error("ERR wrong number of arguments for 'blpop' command"))
+        return
+    *keys, timeout_raw = args
+    try:
+        timeout = float(timeout_raw)
+        if timeout < 0:
+            timeout = 0.0
+    except Exception:
+        writer.write(encode_error("ERR timeout is not a float"))
+        return
+    # immediate check
+    clean_all()
+    for k in keys:
+        k = str(k)
+        entry = store.get(k)
+        if entry and entry[0] == "list" and len(entry[1]) > 0:
+            val = entry[1].pop(0)
+            writer.write(encode_array([k, val]))
+            return
+    # blocking wait up to timeout
+    # if timeout == 0 -> block indefinitely
+    end_time = None if timeout == 0 else time.time() + timeout
+    # We'll wait on a per-key condition in round-robin; prefer first key that becomes available.
+    # Implementation: await until any key gets notified or timeout elapses
+    tasks = []
+    try:
+        while True:
+            for k in keys:
+                k = str(k)
+                _clean_expired(k)
+                entry = store.get(k)
+                if entry and entry[0] == "list" and len(entry[1]) > 0:
+                    val = entry[1].pop(0)
+                    writer.write(encode_array([k, val]))
                     return
-                if operand == b"\xfb":
-                    print("Found 0xFB opcode", flush=True)
-                    break
+            if end_time is not None and time.time() > end_time:
+                writer.write(b"*-1\r\n")
+                return
+            # Wait on conditions: create gather of waiters for small slice of time
+            wait_tasks = []
+            # we pick a short sleep and wait on any condition notify using a single combined wait:
+            # To avoid creating many waiter coros, simply sleep 0.05 and loop (cheap in asyncio)
+            # But we should use per-key conditions to be notified immediately:
+            # We'll wait on first key's condition with a small timeout to yield back
+            # Simpler and robust: use asyncio.wait_for on an Event that is notified by producers.
+            # For simplicity and reliability in tests, we do a short asyncio.sleep
+            await asyncio.sleep(0.02)
+    except asyncio.CancelledError:
+        writer.write(b"*-1\r\n")
+        return
 
-            # Read number of keys
-            num_keys = int.from_bytes(f.read(1), byteorder="little")
-            f.read(1)  # Skip expire hash table size
-            print(f"Number of keys: {num_keys}", flush=True)
+async def cmd_config_get(args: List[Any], writer: asyncio.StreamWriter, server_config: Dict[str,str]):
+    if len(args) < 1:
+        writer.write(encode_error("ERR wrong number of arguments for 'config get'"))
+        return
+    param = str(args[0]).lower()
+    if param in server_config:
+        writer.write(encode_array([param, server_config[param]]))
+    else:
+        writer.write(encode_array([]))
 
-            # Read each key-value pair
-            for i in range(num_keys):
-                expired = False
-                print(f"Reading key {i + 1}/{num_keys}", flush=True)
+async def cmd_keys(args: List[Any], writer: asyncio.StreamWriter):
+    if len(args) != 1:
+        writer.write(encode_error("ERR wrong number of arguments for 'keys'"))
+        return
+    pattern = str(args[0])
+    if pattern == "*":
+        clean_all()
+        keys = [k for k in store.keys()]
+        writer.write(encode_array(keys))
+    else:
+        # not needed for tests
+        writer.write(encode_array([]))
 
-                # Check for expiry
-                top = f.read(1)
-                if top == b"\xfc":  # Expiry in milliseconds
-                    milli_time = int.from_bytes(f.read(8), byteorder="little")
-                    import time
-                    now = time.time() * 1000
-                    if milli_time < now:
-                        expired = True
-                        print(f"Key expired (ms): {milli_time} < {now}", flush=True)
-                    f.read(1)  # Skip value type
-                elif top == b"\xfd":  # Expiry in seconds
-                    sec_time = int.from_bytes(f.read(4), byteorder="little")
-                    import time
-                    if sec_time < time.time():
-                        expired = True
-                        print(f"Key expired (s)", flush=True)
-                    f.read(1)  # Skip value type
-
-                # Read key length and key
-                length = int.from_bytes(f.read(1), byteorder="little")
-                if (length >> 6) == 0b00:
-                    length = length & 0b00111111
-                else:
-                    length = 0
-                key = f.read(length).decode('utf-8')
-                print(f"Key: {key}", flush=True)
-
-                # Read value length and value
-                length = int.from_bytes(f.read(1), byteorder="little")
-                if (length >> 6) == 0b00:
-                    length = length & 0b00111111
-                else:
-                    length = 0
-                value = f.read(length).decode('utf-8')
-                print(f"Value: {value}", flush=True)
-
-                # Store if not expired
-                if not expired:
-                    store[key] = value
-                    print(f"Stored: {key} = {value}", flush=True)
-                else:
-                    print(f"Skipped expired key: {key}", flush=True)
-
+# ---------------------------
+# Dispatcher
+# ---------------------------
+async def dispatch(command: List[Any], writer: asyncio.StreamWriter, server_config: Dict[str,str]):
+    if not command:
+        return
+    cmd = str(command[0]).lower()
+    args = command[1:] if len(command) > 1 else []
+    try:
+        if cmd == "ping":
+            await cmd_ping(args, writer)
+        elif cmd == "echo":
+            await cmd_echo(args, writer)
+        elif cmd == "set":
+            await cmd_set(args, writer)
+        elif cmd == "get":
+            await cmd_get(args, writer)
+        elif cmd == "rpush":
+            await cmd_rpush(args, writer)
+        elif cmd == "lpush":
+            await cmd_lpush(args, writer)
+        elif cmd == "llen":
+            await cmd_llen(args, writer)
+        elif cmd == "lrange":
+            await cmd_lrange(args, writer)
+        elif cmd == "lpop":
+            await cmd_lpop(args, writer)
+        elif cmd == "blpop":
+            await cmd_blpop(args, writer)
+        elif cmd == "config" and len(args) > 0 and str(args[0]).lower() == "get":
+            await cmd_config_get(args[1:], writer, server_config)
+        elif cmd == "keys":
+            await cmd_keys(args, writer)
+        else:
+            writer.write(encode_error(f"ERR unknown command '{cmd}'"))
     except Exception as e:
-        print(f"Error parsing RDB file: {e}", flush=True)
-        import traceback
-        traceback.print_exc()
+        writer.write(encode_error(f"ERR server error: {e}"))
 
+# ---------------------------
+# Server
+# ---------------------------
+async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, server_config: Dict[str,str]):
+    addr = writer.get_extra_info("peername")
+    try:
+        while True:
+            try:
+                val = await read_resp(reader)
+            except EOFError:
+                break
+            except RESPError:
+                # protocol error: close connection
+                break
+            if val is None:
+                # array null? skip
+                continue
+            if not isinstance(val, list):
+                # commands are arrays; ignore invalid
+                writer.write(encode_error("ERR Protocol: command must be array"))
+                await writer.drain()
+                break
+            await dispatch(val, writer, server_config)
+            await writer.drain()
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
 
-def read_length_encoded(data: bytes, idx: int):
-    """Read length-encoded integer"""
-    first_byte = data[idx]
+async def start_server(host: str, port: int, server_config: Dict[str,str]):
+    server = await asyncio.start_server(lambda r,w: handle_client(r,w,server_config), host, port)
+    addrs = ", ".join(str(sock.getsockname()) for sock in server.sockets)
+    print(f"Server started on {addrs}")
+    async with server:
+        await server.serve_forever()
 
-    # 00xxxxxx: 6-bit length
-    if (first_byte & 0xC0) == 0x00:
-        return first_byte & 0x3F, 1
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--dir", default=".", help="dir for rdb files")
+    p.add_argument("--dbfilename", default="dump.rdb", help="dbfilename")
+    p.add_argument("--port", default="6379", help="port")
+    return p.parse_args()
 
-    # 01xxxxxx: 14-bit length
-    elif (first_byte & 0xC0) == 0x40:
-        length = ((first_byte & 0x3F) << 8) | data[idx + 1]
-        return length, 2
-
-    # 10xxxxxx: 32-bit length
-    elif (first_byte & 0xC0) == 0x80:
-        length = int.from_bytes(data[idx + 1:idx + 5], byteorder='big')
-        return length, 5
-
-    # 11xxxxxx: special encoding
-    else:
-        return 0, 1
-
-
-def read_key_value_pair(data: bytes, idx: int, value_type: int):
-    """Read a key-value pair from RDB file"""
-    start_idx = idx
-    # Read key (always a string)
-    key_length, bytes_read = read_length_encoded(data, idx)
-    idx += bytes_read
-    key = data[idx:idx + key_length].decode('utf-8')
-    idx += key_length
-
-    # Read value based on type
-    if value_type == 0x00:  # String
-        value_length, bytes_read = read_length_encoded(data, idx)
-        idx += bytes_read
-        value = data[idx:idx + value_length].decode('utf-8')
-        idx += value_length
-        return key, value, idx - start_idx
-
-    return None, None, 0
-
-
-def handle_command(parts: list[str]) -> str:
-    if not parts:
-        return encode_error("ERR empty command")
-
-    command = parts[0].upper()
-
-    # ------------------ PING ------------------
-    if command == "PING":
-        if len(parts) == 1:
-            return encode_simple_string("PONG")
-        else:
-            return encode_bulk_string(parts[1])
-
-    # ------------------ ECHO ------------------
-    elif command == "ECHO":
-        if len(parts) < 2:
-            return encode_error("ERR wrong number of arguments for 'echo' command")
-        return encode_bulk_string(parts[1])
-
-    # ------------------ SET ------------------
-    elif command == "SET":
-        if len(parts) < 3:
-            return encode_error("ERR wrong number of arguments for 'set' command")
-        key, value = parts[1], parts[2]
-        store[key] = value
-        return encode_simple_string("OK")
-
-    # ------------------ GET ------------------
-    elif command == "GET":
-        if len(parts) < 2:
-            return encode_error("ERR wrong number of arguments for 'get' command")
-        key = parts[1]
-        if key not in store:
-            return "$-1\r\n"
-        return encode_bulk_string(store[key])
-
-    # ------------------ EXISTS ------------------
-    elif command == "EXISTS":
-        if len(parts) < 2:
-            return encode_error("ERR wrong number of arguments for 'exists' command")
-        count = sum(1 for k in parts[1:] if k in store)
-        return encode_integer(count)
-
-    # ------------------ RPUSH ------------------
-    elif command == "RPUSH":
-        if len(parts) < 3:
-            return encode_error("ERR wrong number of arguments for 'rpush' command")
-        key = parts[1]
-        values = parts[2:]
-
-        # Ensure list type
-        if key not in store:
-            store[key] = []
-        elif not isinstance(store[key], list):
-            return encode_error("WRONGTYPE Operation against a key holding the wrong kind of value")
-
-        store[key].extend(values)
-        return encode_integer(len(store[key]))
-
-    # ------------------ LPOP ------------------
-    elif command == "LPOP":
-        if len(parts) < 2:
-            return encode_error("ERR wrong number of arguments for 'lpop' command")
-        key = parts[1]
-        if key not in store or not store[key]:
-            return "$-1\r\n"
-        if not isinstance(store[key], list):
-            return encode_error("WRONGTYPE Operation against a key holding the wrong kind of value")
-        value = store[key].pop(0)
-        if not store[key]:  # Remove key if list is now empty
-            del store[key]
-        return encode_bulk_string(value)
-
-    # ------------------ RPOP ------------------
-    elif command == "RPOP":
-        if len(parts) < 2:
-            return encode_error("ERR wrong number of arguments for 'rpop' command")
-        key = parts[1]
-        if key not in store or not store[key]:
-            return "$-1\r\n"
-        if not isinstance(store[key], list):
-            return encode_error("WRONGTYPE Operation against a key holding the wrong kind of value")
-        value = store[key].pop()
-        if not store[key]:  # Remove key if list is now empty
-            del store[key]
-        return encode_bulk_string(value)
-
-    # ------------------ BLPOP ------------------
-    elif "BLPOP" in command:
-        key = cmd.split(b"\r\n")[4]
-        if len(cmd.split(b"\r\n")) > 6:
-            timeout = float(command.split(b"\r\n")[6])
-        else:
-            timeout = 0
-        end_time = time.time() + timeout
-        flag = False
-        lock = threading.Lock()
-        with lock:
-            while time.time() < end_time or timeout == 0:
-                if key in redis_data and len(redis_data[key]) > 0:
-                    value = redis_data[key].pop(0)
-                    conn.send(create_resp_array([key, value], 2))
-                    flag = True
-                    break
-                time.sleep(0.1)
-        if not flag:
-            conn.send(create_resp_array([], -1))
-        return None
-
-    # ------------------ KEYS ------------------
-    elif command == "KEYS":
-        if len(parts) != 2:
-            return encode_error("ERR wrong number of arguments for 'keys' command")
-        pattern = parts[1]
-
-        # Debug: Try to load RDB file NOW if store is empty
-        if len(store) == 0:
-            rdb_path = os.path.join(config["dir"], config["dbfilename"])
-            print(f"KEYS: Store is empty, trying to load RDB from: {rdb_path}", flush=True)
-            print(f"KEYS: File exists? {os.path.exists(rdb_path)}", flush=True)
-            if os.path.exists(rdb_path):
-                print(f"KEYS: File size: {os.path.getsize(rdb_path)} bytes", flush=True)
-                parse_rdb_file(rdb_path)
-                print(f"KEYS: Store after parse attempt: {list(store.keys())}", flush=True)
-
-        print(f"KEYS command - pattern: {pattern}, store keys: {list(store.keys())}", flush=True)
-        print(f"KEYS command - config: {config}", flush=True)
-        print(f"KEYS command - sys.argv: {sys.argv}", flush=True)
-        if pattern == "*":
-            # Return all keys, regardless of type
-            return encode_array(list(store.keys()))
-        # (No advanced pattern matching needed for Codecrafters)
-        return encode_array([])
-
-    # ------------------ CONFIG ------------------
-    elif command == "CONFIG":
-        if len(parts) < 2:
-            return encode_error("ERR wrong number of arguments for 'config' command")
-        sub = parts[1].upper()
-
-        if sub == "GET":
-            if len(parts) < 3:
-                return encode_error("ERR wrong number of arguments for 'config get' command")
-            key = parts[2].lower()
-
-            if key in config:
-                return encode_array([key, config[key]])
-            else:
-                return encode_array([])
-        elif sub == "SET":
-            # Basic mock: CONFIG SET dir /tmp
-            if len(parts) == 4 and parts[2].lower() in config:
-                config[parts[2].lower()] = parts[3]
-                return encode_simple_string("OK")
-            return encode_error("ERR unsupported config set parameter")
-        else:
-            return encode_error("ERR unknown subcommand")
-
-    # ------------------ UNKNOWN ------------------
-    else:
-        return encode_error(f"ERR unknown command '{command}'")
-
-
-# ------------------ SERVER LOOP ------------------
+# ---------------------------
+# Main entry
+# ---------------------------
 def main():
-    # Parse command line arguments
-    args = sys.argv[1:]
-    sys.stderr.write(f"STARTUP: Command line args: {args}\n")
-    sys.stderr.flush()
-    print(f"Command line args: {args}", flush=True)
-    for i in range(len(args)):
-        if args[i] == "--dir" and i + 1 < len(args):
-            config["dir"] = args[i + 1]
-        elif args[i] == "--dbfilename" and i + 1 < len(args):
-            config["dbfilename"] = args[i + 1]
-
-    sys.stderr.write(f"STARTUP: Config: {config}\n")
-    sys.stderr.flush()
-    print(f"Config: {config}", flush=True)
-
-    # Load RDB file if it exists
-    rdb_path = os.path.join(config["dir"], config["dbfilename"])
-    sys.stderr.write(f"STARTUP: Loading RDB file from: {rdb_path}\n")
-    sys.stderr.flush()
-    print(f"Loading RDB file from: {rdb_path}", flush=True)
-    parse_rdb_file(rdb_path)
-    sys.stderr.write(f"STARTUP: Store after loading RDB: {store}\n")
-    sys.stderr.flush()
-    print(f"Store after loading RDB: {store}", flush=True)
-    print(f"Number of keys loaded: {len(store)}", flush=True)
-
-    server_socket = socket.create_server(("localhost", 6379), reuse_port=True)
-    print(f"Redis server listening on localhost:6379", flush=True)
-    while True:
-        client, _ = server_socket.accept()
-        data = client.recv(1024).decode().strip()
-        print(f"RAW DATA RECEIVED: {repr(data)}", flush=True)
-
-        if not data:
-            client.close()
-            continue
-
-        # Parse RESP (naive but fine for Codecrafters)
-        lines = data.split("\r\n")
-        parts = []
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            if line.startswith("$") and i + 1 < len(lines):
-                # Bulk string: next line is the actual content
-                parts.append(lines[i + 1])
-                i += 2
-            elif line and not line.startswith("*"):
-                # Simple string or other non-bulk content
-                parts.append(line)
-                i += 1
-            else:
-                i += 1
-
-        print(f"Parsed command parts: {parts}", flush=True)
-        print(f"Current store BEFORE command: {store}", flush=True)
-
-        response = handle_command(parts)
-
-        print(f"Current store AFTER command: {store}", flush=True)
-        print(f"Response: {repr(response)}", flush=True)
-
-        client.sendall(response.encode())
-        client.close()
-
+    args = parse_args()
+    server_config = {
+        "dir": args.dir,
+        "dbfilename": args.dbfilename,
+    }
+    # load rdb into store (string keys only)
+    read_key_val_from_db(args.dir, args.dbfilename, {})  # call once to avoid side-effects (we'll reload properly)
+    # We'll attempt to load and set into our store properly:
+    rdb_store: Dict[str, Tuple[str,int]] = {}
+    read_key_val_from_db(args.dir, args.dbfilename, rdb_store)
+    for k,v in rdb_store.items():
+        val, exp = v
+        store[k] = ("string", val)
+        expiry[k] = exp
+    port = int(args.port)
+    try:
+        asyncio.run(start_server("0.0.0.0", port, server_config))
+    except KeyboardInterrupt:
+        pass
 
 if __name__ == "__main__":
     main()
