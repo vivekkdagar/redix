@@ -3,7 +3,7 @@ import threading
 import time
 import argparse
 
-from app.rdb_parser import RDBParser
+from rdb_parser import RDBParser
 
 parser = argparse.ArgumentParser()
 
