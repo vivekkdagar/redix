@@ -1,7 +1,13 @@
 import socket
+import sys
+import os
 
 # In-memory store
 store = {}
+config = {
+    "dir": "/tmp",
+    "dbfilename": "dump.rdb"
+}
 
 
 def encode_bulk_string(value: str) -> str:
@@ -27,6 +33,133 @@ def encode_array(values: list[str]) -> str:
     for v in values:
         resp += encode_bulk_string(v)
     return resp
+
+
+def parse_rdb_file(filepath: str):
+    """Parse RDB file and load keys into store"""
+    try:
+        if not os.path.exists(filepath):
+            print(f"RDB file not found: {filepath}", flush=True)
+            return
+
+        with open(filepath, "rb") as f:
+            data = f.read()
+            print(f"RDB file size: {len(data)} bytes", flush=True)
+
+            # Parse RDB file
+            # Magic string "REDIS" + version (4 bytes)
+            if data[:5] != b"REDIS":
+                print("Invalid RDB file: missing REDIS header", flush=True)
+                return
+
+            idx = 9  # Skip header (REDIS + 4 byte version)
+
+            while idx < len(data):
+                opcode = data[idx]
+                idx += 1
+
+                # 0xFE: Database selector
+                if opcode == 0xFE:
+                    # Read database number (length-encoded)
+                    db_num, bytes_read = read_length_encoded(data, idx)
+                    idx += bytes_read
+                    print(f"Database: {db_num}", flush=True)
+
+                # 0xFB: Hash table size info
+                elif opcode == 0xFB:
+                    hash_table_size, bytes_read = read_length_encoded(data, idx)
+                    idx += bytes_read
+                    expire_hash_size, bytes_read = read_length_encoded(data, idx)
+                    idx += bytes_read
+                    print(f"Hash table size: {hash_table_size}, Expire hash size: {expire_hash_size}", flush=True)
+
+                # 0xFD: Expiry time in seconds
+                elif opcode == 0xFD:
+                    # Skip 4 bytes of expiry time for now
+                    idx += 4
+                    # Read the key-value pair after expiry
+                    value_type = data[idx]
+                    idx += 1
+                    key, value, bytes_read = read_key_value_pair(data, idx, value_type)
+                    idx += bytes_read
+                    if key:
+                        store[key] = value
+                        print(f"Loaded key with expiry: {key} = {value}", flush=True)
+
+                # 0xFC: Expiry time in milliseconds
+                elif opcode == 0xFC:
+                    # Skip 8 bytes of expiry time for now
+                    idx += 8
+                    # Read the key-value pair after expiry
+                    value_type = data[idx]
+                    idx += 1
+                    key, value, bytes_read = read_key_value_pair(data, idx, value_type)
+                    idx += bytes_read
+                    if key:
+                        store[key] = value
+                        print(f"Loaded key with expiry (ms): {key} = {value}", flush=True)
+
+                # 0xFF: End of file
+                elif opcode == 0xFF:
+                    print("Reached end of RDB file", flush=True)
+                    break
+
+                # 0x00: String encoding
+                elif opcode == 0x00:
+                    key, value, bytes_read = read_key_value_pair(data, idx, opcode)
+                    idx += bytes_read
+                    if key:
+                        store[key] = value
+                        print(f"Loaded key: {key} = {value}", flush=True)
+
+                else:
+                    print(f"Unknown opcode: 0x{opcode:02x} at position {idx - 1}", flush=True)
+                    break
+
+    except Exception as e:
+        print(f"Error parsing RDB file: {e}", flush=True)
+
+
+def read_length_encoded(data: bytes, idx: int):
+    """Read length-encoded integer"""
+    first_byte = data[idx]
+
+    # 00xxxxxx: 6-bit length
+    if (first_byte & 0xC0) == 0x00:
+        return first_byte & 0x3F, 1
+
+    # 01xxxxxx: 14-bit length
+    elif (first_byte & 0xC0) == 0x40:
+        length = ((first_byte & 0x3F) << 8) | data[idx + 1]
+        return length, 2
+
+    # 10xxxxxx: 32-bit length
+    elif (first_byte & 0xC0) == 0x80:
+        length = int.from_bytes(data[idx + 1:idx + 5], byteorder='big')
+        return length, 5
+
+    # 11xxxxxx: special encoding
+    else:
+        return 0, 1
+
+
+def read_key_value_pair(data: bytes, idx: int, value_type: int):
+    """Read a key-value pair from RDB file"""
+    # Read key (always a string)
+    key_length, bytes_read = read_length_encoded(data, idx)
+    idx += bytes_read
+    key = data[idx:idx + key_length].decode('utf-8')
+    idx += key_length
+
+    # Read value based on type
+    if value_type == 0x00:  # String
+        value_length, bytes_read = read_length_encoded(data, idx)
+        idx += bytes_read
+        value = data[idx:idx + value_length].decode('utf-8')
+        idx += value_length
+        return key, value, idx
+
+    return None, None, idx
 
 
 def handle_command(parts: list[str]) -> str:
@@ -138,14 +271,14 @@ def handle_command(parts: list[str]) -> str:
                 return encode_error("ERR wrong number of arguments for 'config get' command")
             key = parts[2].lower()
 
-            if key == "dir":
-                dir_path = "/tmp"
-                return encode_array(["dir", dir_path])
+            if key in config:
+                return encode_array([key, config[key]])
             else:
                 return encode_array([])
         elif sub == "SET":
             # Basic mock: CONFIG SET dir /tmp
-            if len(parts) == 4 and parts[2].lower() == "dir":
+            if len(parts) == 4 and parts[2].lower() in config:
+                config[parts[2].lower()] = parts[3]
                 return encode_simple_string("OK")
             return encode_error("ERR unsupported config set parameter")
         else:
@@ -158,6 +291,22 @@ def handle_command(parts: list[str]) -> str:
 
 # ------------------ SERVER LOOP ------------------
 def main():
+    # Parse command line arguments
+    args = sys.argv[1:]
+    for i in range(len(args)):
+        if args[i] == "--dir" and i + 1 < len(args):
+            config["dir"] = args[i + 1]
+        elif args[i] == "--dbfilename" and i + 1 < len(args):
+            config["dbfilename"] = args[i + 1]
+
+    print(f"Config: {config}", flush=True)
+
+    # Load RDB file if it exists
+    rdb_path = os.path.join(config["dir"], config["dbfilename"])
+    print(f"Loading RDB file from: {rdb_path}", flush=True)
+    parse_rdb_file(rdb_path)
+    print(f"Store after loading RDB: {store}", flush=True)
+
     server_socket = socket.create_server(("localhost", 6379), reuse_port=True)
     print(f"Redis server listening on localhost:6379", flush=True)
     while True:
