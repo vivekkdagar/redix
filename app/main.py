@@ -1,8 +1,7 @@
-import socket
-import threading
+import asyncio
 import os
-import time
 import sys
+import time
 
 # ---------------- In-memory storage ----------------
 data_store = {}
@@ -28,9 +27,8 @@ def encode_array(arr) -> bytes:
         return b"*-1\r\n"
     res = f"*{len(arr)}\r\n"
     for item in arr:
-        # Ensure item is a string/decoded for len() and formatting
         if isinstance(item, bytes):
-            item = item.decode('utf-8')
+            item = item.decode()
         res += f"${len(item)}\r\n{item}\r\n"
     return res.encode()
 
@@ -44,8 +42,9 @@ def parse_resp_array(data: bytes):
     result = []
     i = 1
     for _ in range(arr_len):
+        if i >= len(parts):
+            break
         if parts[i].startswith(b"$"):
-            # strlen = int(parts[i][1:]) # Not strictly needed
             i += 1
             result.append(parts[i].decode())
             i += 1
@@ -67,12 +66,10 @@ def _read_length(f):
     elif prefix == 2:
         b4 = f.read(4)
         return int.from_bytes(b4, "little")
-    else:
-        return 0
+    return 0
 
 
 def _read_string(f):
-    """Read an RDB encoded string (supports length encodings)"""
     first = f.read(1)
     if not first:
         return None
@@ -87,44 +84,41 @@ def _read_string(f):
         b4 = f.read(4)
         strlen = int.from_bytes(b4, "little")
     else:
-        # Handle special integer encodings if necessary, but for string reading, we assume direct length
         return None
-
-    return f.read(strlen).decode("utf-8", errors="ignore")
+    return f.read(strlen).decode(errors="ignore")
 
 
 def read_rdb_file(dir_path, dbfile):
-    """Load keys from dump.rdb"""
     path = os.path.join(dir_path, dbfile)
     if not os.path.exists(path):
         return
     try:
         with open(path, "rb") as f:
-            header = f.read(9)  # REDISxxxx
+            header = f.read(9)
             if not header.startswith(b"REDIS"):
                 return
             while True:
                 b = f.read(1)
                 if not b:
                     break
-                if b == b'\x00':  # type: string
+                if b == b"\x00":  # string
                     key = _read_string(f)
                     val = _read_string(f)
                     if key:
                         data_store[key] = (val, -1)
-                elif b == b'\xfe':  # SELECTDB opcode
+                elif b == b"\xfe":  # SELECTDB
                     _ = _read_length(f)
-                elif b == b'\xfb':  # RESIZEDB
+                elif b == b"\xfb":  # RESIZEDB
                     _ = _read_length(f)
                     _ = _read_length(f)
-                elif b == b'\xff':  # EOF
+                elif b == b"\xff":  # EOF
                     break
     except Exception as e:
         print("Error parsing RDB:", e)
 
 
 # ---------------- Command Handler ----------------
-def handle_command(cmd):
+async def handle_command(cmd):
     if not cmd:
         return b""
 
@@ -132,15 +126,18 @@ def handle_command(cmd):
 
     if op == "PING":
         return encode_simple_string("PONG" if len(cmd) == 1 else cmd[1])
+
     elif op == "ECHO":
         return encode_bulk_string(cmd[1] if len(cmd) > 1 else "")
+
     elif op == "SET":
         key, val = cmd[1], cmd[2]
         expiry = -1
         if len(cmd) > 3 and cmd[3].upper() == "PX":
-            expiry = time.time() + int(cmd[4]) / 1000.0
+            expiry = time.time() + int(cmd[4]) / 1000
         data_store[key] = (val, expiry)
         return encode_simple_string("OK")
+
     elif op == "GET":
         key = cmd[1]
         if key not in data_store:
@@ -150,78 +147,62 @@ def handle_command(cmd):
             del data_store[key]
             return encode_bulk_string(None)
         return encode_bulk_string(val)
+
     elif op == "CONFIG" and len(cmd) >= 3 and cmd[1].upper() == "GET":
         key = cmd[2]
         if key in config_store:
             return encode_array([key, config_store[key]])
         return encode_array([])
+
     elif op == "KEYS":
-        # Note: Proper KEYS implementation should check for expiration, but
-        # this is kept simple as it wasn't the main issue here.
         if cmd[1] == "*":
             return encode_array(list(data_store.keys()))
-        else:
-            return encode_array([])
+        return encode_array([])
 
-    # --- FIX: Handle BLPOP command ---
-    elif op == "BLPOP":
-        key = cmd[1]
-        timeout = float(cmd[2]) if len(cmd) > 2 else 0
-        start_time = time.time()
-        value = None
-
-        # Wait until timeout or value found
-        while time.time() - start_time < timeout:
-            if key in data_store and isinstance(data_store[key][0], list) and len(data_store[key][0]) > 0:
-                value = data_store[key][0].pop(0)
-                break
-            await asyncio.sleep(0.05)
-
-        if value is not None:
-            # ✅ Redis expects [key, value]
-            resp = f"*2\r\n${len(key)}\r\n{key}\r\n${len(value)}\r\n{value}\r\n"
-            return resp.encode()
-        else:
-            # ✅ Timeout case: null array
-            return b"*-1\r\n"
     elif op == "RPUSH":
         key = cmd[1]
         values = cmd[2:]
         if key not in data_store:
             data_store[key] = ([], -1)
-        # If key was not a list, convert it
         if not isinstance(data_store[key][0], list):
             data_store[key] = ([], -1)
         data_store[key][0].extend(values)
         length = len(data_store[key][0])
         return f":{length}\r\n".encode()
 
-    # --- Fall-through for unhandled commands (optional, usually returns ERR) ---
-    else:
-        # Returning "OK" is technically incorrect for unknown commands, but
-        # if this is needed for passing earlier stages, keep it. A proper server
-        # should return an error: return encode_simple_string(f"ERR unknown command '{op}'")
-        return encode_simple_string("OK")
+    elif op == "BLPOP":
+        key = cmd[1]
+        timeout = float(cmd[2]) if len(cmd) > 2 else 0
+        start = time.time()
+        value = None
+
+        while time.time() - start < timeout:
+            if key in data_store and isinstance(data_store[key][0], list) and len(data_store[key][0]) > 0:
+                value = data_store[key][0].pop(0)
+                break
+            await asyncio.sleep(0.05)
+
+        if value is not None:
+            return encode_array([key, value])
+        return b"*-1\r\n"
+
+    return encode_simple_string("OK")
 
 
 # ---------------- Networking ----------------
-def handle_client(conn):
-    try:
-        while True:
-            data = conn.recv(4096)
-            if not data:
-                break
-            cmd = parse_resp_array(data)
-            # Pass the connection object to handle_command if actual blocking logic is needed
-            resp = handle_command(cmd)
-            conn.sendall(resp)
-    except Exception as e:
-        print("Client error:", e)
-    finally:
-        conn.close()
+async def handle_client(reader, writer):
+    while True:
+        data = await reader.read(4096)
+        if not data:
+            break
+        cmd = parse_resp_array(data)
+        resp = await handle_command(cmd)
+        writer.write(resp)
+        await writer.drain()
+    writer.close()
 
 
-def main():
+async def main():
     args = sys.argv[1:]
     if "--dir" in args:
         config_store["dir"] = args[args.index("--dir") + 1]
@@ -229,13 +210,12 @@ def main():
         config_store["dbfilename"] = args[args.index("--dbfilename") + 1]
 
     read_rdb_file(config_store["dir"], config_store["dbfilename"])
-    print("Loaded keys:", list(data_store.keys()))
 
-    server = socket.create_server(("localhost", 6379), reuse_port=True)
-    while True:
-        conn, _ = server.accept()
-        threading.Thread(target=handle_client, args=(conn,), daemon=True).start()
+    server = await asyncio.start_server(handle_client, "0.0.0.0", 6379)
+    print("Server running on 6379")
+    async with server:
+        await server.serve_forever()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
