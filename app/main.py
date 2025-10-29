@@ -294,6 +294,8 @@ def handle_command(parts: list[str]) -> str:
 def main():
     # Parse command line arguments
     args = sys.argv[1:]
+    sys.stderr.write(f"STARTUP: Command line args: {args}\n")
+    sys.stderr.flush()
     print(f"Command line args: {args}", flush=True)
     for i in range(len(args)):
         if args[i] == "--dir" and i + 1 < len(args):
@@ -301,12 +303,18 @@ def main():
         elif args[i] == "--dbfilename" and i + 1 < len(args):
             config["dbfilename"] = args[i + 1]
 
+    sys.stderr.write(f"STARTUP: Config: {config}\n")
+    sys.stderr.flush()
     print(f"Config: {config}", flush=True)
 
     # Load RDB file if it exists
     rdb_path = os.path.join(config["dir"], config["dbfilename"])
+    sys.stderr.write(f"STARTUP: Loading RDB file from: {rdb_path}\n")
+    sys.stderr.flush()
     print(f"Loading RDB file from: {rdb_path}", flush=True)
     parse_rdb_file(rdb_path)
+    sys.stderr.write(f"STARTUP: Store after loading RDB: {store}\n")
+    sys.stderr.flush()
     print(f"Store after loading RDB: {store}", flush=True)
     print(f"Number of keys loaded: {len(store)}", flush=True)
 
