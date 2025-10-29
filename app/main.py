@@ -655,30 +655,30 @@ def cmd_executor(decoded_data, connection, config, queued, executing):
         connection.sendall(error_encoder("ERR wrong number of arguments for 'set'"))
         return (b"", queued)
 
-    if cmd == "GET":
-        if len(decoded_data) >= 2:
-            key = decoded_data[1]
-            # Prefer in-memory store, else fallback to config['store']
-            val = None
-            if key in store:
-                val = store[key]
-            elif 'store' in config and key in config['store']:
-                val = config['store'][key]
+    if cmd == "GET" and len(decoded_data) >= 2:
+        key = decoded_data[1]
+        value = None
 
-            if val is not None:
-                if isinstance(val, tuple):
-                    val_str = val[0]
-                else:
-                    val_str = val
-                value = val_str.encode()
-                response = b"$" + str(len(value)).encode() + b"\r\n" + value + b"\r\n"
-                connection.sendall(response)
+        # Check in-memory store first, then RDB-loaded store
+        if key in store:
+            value = store[key]
+        elif 'store' in config and key in config['store']:
+            val_entry = config['store'][key]
+            if isinstance(val_entry, tuple):
+                value = val_entry[0]
             else:
-                # Missing key → null bulk string
-                connection.sendall(b"$-1\r\n")
-            return (b"", queued)
-        connection.sendall(error_encoder("ERR wrong number of arguments for 'get'"))
-        return (b"", queued)
+                value = val_entry
+
+        if value is not None:
+            if isinstance(value, tuple):
+                value = value[0]
+            value_bytes = str(value).encode()
+            response = b"$" + str(len(value_bytes)).encode() + b"\r\n" + value_bytes + b"\r\n"
+            connection.sendall(response)
+        else:
+            # Null bulk string for missing key
+            connection.sendall(b"$-1\r\n")
+        return b"", queued
 
     # Lists
     if cmd == "RPUSH":
