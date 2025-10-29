@@ -658,9 +658,14 @@ def cmd_executor(decoded_data, connection, config, queued, executing):
     if cmd == "GET":
         if len(decoded_data) >= 2:
             key = decoded_data[1]
+            # Prefer in-memory store, else fallback to config['store']
+            val = None
             if key in store:
                 val = store[key]
-                # handle (value, expiry)
+            elif 'store' in config and key in config['store']:
+                val = config['store'][key]
+
+            if val is not None:
                 if isinstance(val, tuple):
                     val_str = val[0]
                 else:
@@ -669,8 +674,8 @@ def cmd_executor(decoded_data, connection, config, queued, executing):
                 response = b"$" + str(len(value)).encode() + b"\r\n" + value + b"\r\n"
                 connection.sendall(response)
             else:
-                # Return empty bulk string instead of null
-                connection.sendall(b"$0\r\n\r\n")
+                # Missing key → null bulk string
+                connection.sendall(b"$-1\r\n")
             return (b"", queued)
         connection.sendall(error_encoder("ERR wrong number of arguments for 'get'"))
         return (b"", queued)
