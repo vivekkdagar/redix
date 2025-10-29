@@ -669,8 +669,8 @@ def cmd_executor(decoded_data, connection, config, queued, executing):
                 response = b"$" + str(len(value)).encode() + b"\r\n" + value + b"\r\n"
                 connection.sendall(response)
             else:
-                # Null bulk string for missing key
-                connection.sendall(b"$-1\r\n")
+                # Return empty bulk string instead of null
+                connection.sendall(b"$0\r\n\r\n")
             return (b"", queued)
         connection.sendall(error_encoder("ERR wrong number of arguments for 'get'"))
         return (b"", queued)
