@@ -159,10 +159,12 @@ def handle_command(parts: list[str]) -> str:
 # ------------------ SERVER LOOP ------------------
 def main():
     server_socket = socket.create_server(("localhost", 6379), reuse_port=True)
-    print(f"Redis server listening on localhost:6379")
+    print(f"Redis server listening on localhost:6379", flush=True)
     while True:
         client, _ = server_socket.accept()
         data = client.recv(1024).decode().strip()
+        print(f"RAW DATA RECEIVED: {repr(data)}", flush=True)
+
         if not data:
             client.close()
             continue
@@ -184,11 +186,13 @@ def main():
             else:
                 i += 1
 
-        print(f"Parsed command parts: {parts}")
-        print(f"Current store: {store}")
+        print(f"Parsed command parts: {parts}", flush=True)
+        print(f"Current store BEFORE command: {store}", flush=True)
 
         response = handle_command(parts)
-        print(f"Response: {response.strip()}")
+
+        print(f"Current store AFTER command: {store}", flush=True)
+        print(f"Response: {repr(response)}", flush=True)
 
         client.sendall(response.encode())
         client.close()
