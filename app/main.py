@@ -655,38 +655,25 @@ def cmd_executor(decoded_data, connection, config, queued, executing):
         connection.sendall(error_encoder("ERR wrong number of arguments for 'set'"))
         return (b"", queued)
 
-    if cmd == "GET":
-        if len(decoded_data) >= 2:
-            key = decoded_data[1]
-            print("role", config["role"])
-            val = None
+    elif cmd.upper() == "GET":
+        print("role", config["role"])
+        key = decoded_data[1]
 
-            # 1️⃣ Prefer runtime store (normal SETs)
-            if key in store:
-                val = store[key]
-            # 2️⃣ Else fallback to RDB-loaded store (from config)
-            elif "store" in config and key in config["store"]:
-                val = config["store"][key]
+        # First check in-memory store via getter()
+        value = getter(key)
 
-            # 3️⃣ Extract real string if (value, expiry)
-            if val is not None:
-                if isinstance(val, tuple):
-                    val = val[0]
-                if isinstance(val, str):
-                    value_bytes = val.encode()
-                else:
-                    value_bytes = str(val).encode()
-                response = b"$" + str(len(value_bytes)).encode() + b"\r\n" + value_bytes + b"\r\n"
-                print(f"GET response: {response}")
-                connection.sendall(response)
-            else:
-                # 4️⃣ Null bulk string for missing key
-                connection.sendall(b"$-1\r\n")
+        # Fallback: check in RDB-loaded config store
+        if value is None and "store" in config and key in config["store"]:
+            val = config["store"][key]
+            value = val[0] if isinstance(val, tuple) else val
 
-            return (b"", queued)
-
-        connection.sendall(error_encoder("ERR wrong number of arguments for 'get'"))
-        return (b"", queued)
+        # Encode and send
+        response = resp_encoder(value)
+        print(f"GET response: {response}")
+        if executing:
+            return response, queued
+        connection.sendall(response)
+        return [], queued
 
     # Lists
     if cmd == "RPUSH":
