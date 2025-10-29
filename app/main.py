@@ -161,7 +161,21 @@ def main():
             continue
 
         # Parse RESP (naive but fine for Codecrafters)
-        parts = [p for p in data.split("\r\n") if p and not p.startswith("*") and not p.startswith("$")]
+        lines = data.split("\r\n")
+        parts = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if line.startswith("$") and i + 1 < len(lines):
+                # Bulk string: next line is the actual content
+                parts.append(lines[i + 1])
+                i += 2
+            elif line and not line.startswith("*"):
+                # Simple string or other non-bulk content
+                parts.append(line)
+                i += 1
+            else:
+                i += 1
 
         response = handle_command(parts)
         client.sendall(response.encode())
