@@ -3,17 +3,22 @@ import socket
 # In-memory store
 store = {}
 
+
 def encode_bulk_string(value: str) -> str:
     return f"${len(value)}\r\n{value}\r\n"
+
 
 def encode_simple_string(value: str) -> str:
     return f"+{value}\r\n"
 
+
 def encode_error(value: str) -> str:
     return f"-{value}\r\n"
 
+
 def encode_integer(value: int) -> str:
     return f":{value}\r\n"
+
 
 def encode_array(values: list[str]) -> str:
     if not values:
@@ -22,6 +27,7 @@ def encode_array(values: list[str]) -> str:
     for v in values:
         resp += encode_bulk_string(v)
     return resp
+
 
 def handle_command(parts: list[str]) -> str:
     if not parts:
@@ -153,6 +159,7 @@ def handle_command(parts: list[str]) -> str:
 # ------------------ SERVER LOOP ------------------
 def main():
     server_socket = socket.create_server(("localhost", 6379), reuse_port=True)
+    print(f"Redis server listening on localhost:6379")
     while True:
         client, _ = server_socket.accept()
         data = client.recv(1024).decode().strip()
@@ -177,7 +184,12 @@ def main():
             else:
                 i += 1
 
+        print(f"Parsed command parts: {parts}")
+        print(f"Current store: {store}")
+
         response = handle_command(parts)
+        print(f"Response: {response.strip()}")
+
         client.sendall(response.encode())
         client.close()
 
