@@ -40,11 +40,20 @@ def parse_rdb_file(filepath: str):
     try:
         if not os.path.exists(filepath):
             print(f"RDB file not found: {filepath}", flush=True)
+            sys.stderr.write(f"RDB file not found: {filepath}\n")
+            sys.stderr.flush()
             return
 
         with open(filepath, "rb") as f:
             data = f.read()
             print(f"RDB file size: {len(data)} bytes", flush=True)
+            sys.stderr.write(f"RDB file size: {len(data)} bytes\n")
+            sys.stderr.flush()
+            # Print first 100 bytes as hex for debugging
+            hex_dump = ' '.join(f'{b:02x}' for b in data[:100])
+            print(f"First 100 bytes (hex): {hex_dump}", flush=True)
+            sys.stderr.write(f"First 100 bytes (hex): {hex_dump}\n")
+            sys.stderr.flush()
 
             # Parse RDB file
             # Magic string "REDIS" + version (4 bytes)
