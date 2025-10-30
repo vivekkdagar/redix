@@ -289,14 +289,28 @@ def handle_command(
         case [b"GET", k]:
             if not queue_transaction(value, conn):
                 now = datetime.datetime.now()
-                db_value = db.get(k)  # Changed variable name to avoid confusion
+                db_value = db.get(k)
+
                 if db_value is None:
+                    # key not found
                     response = None
                 elif db_value.expiry is not None and now >= db_value.expiry:
+                    # expired
                     db.pop(k)
                     response = None
                 else:
-                    response = db_value.value
+                    val = db_value.value
+                    # handle all possible value types
+                    if val is None:
+                        response = None
+                    elif isinstance(val, bytes):
+                        response = val
+                    elif isinstance(val, str):
+                        # empty string → $0\r\n\r\n (valid Redis empty bulk string)
+                        response = val.encode()
+                    else:
+                        # fallback (e.g. list or something else)
+                        response = str(val).encode()
         case [b"INFO", b"replication"]:
             if args.replicaof is None:
                 response = f"""\
