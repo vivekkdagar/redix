@@ -289,14 +289,28 @@ def handle_command(
         case [b"GET", k]:
             if not queue_transaction(value, conn):
                 now = datetime.datetime.now()
-                db_value = db.get(k)  # Changed variable name to avoid confusion
+                key_str = k.decode() if isinstance(k, (bytes, bytearray)) else k
+                db_value = db.get(key_str) or db.get(k)
+
                 if db_value is None:
+                    # Key not found
                     response = None
                 elif db_value.expiry is not None and now >= db_value.expiry:
-                    db.pop(k)
+                    # Expired
+                    db.pop(key_str, None)
                     response = None
                 else:
-                    response = db_value.value
+                    val = db_value.value
+                    # Handle possible RDB-loaded strings (they are stored as str)
+                    if isinstance(val, str):
+                        response = val.encode()
+                    elif isinstance(val, bytes):
+                        response = val
+                    elif val is None:
+                        response = None
+                    else:
+                        # Convert any other type (e.g. int, float) to string bytes
+                        response = str(val).encode()
         case [b"INFO", b"replication"]:
             if args.replicaof is None:
                 response = f"""\
