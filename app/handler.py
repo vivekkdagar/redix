@@ -77,7 +77,7 @@ def cmd_executor(decoded_data, connection, config, queued, executing):
             return response, queued
         connection.sendall(response)
         return [], queued
-    # GET
+    # GET d
     elif decoded_data[0].upper() == "GET":
         print("role", config['role'])
         response = resp_encoder(getter(decoded_data[1]))
