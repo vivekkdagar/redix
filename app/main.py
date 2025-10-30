@@ -289,14 +289,23 @@ def handle_command(
         case [b"GET", k]:
             if not queue_transaction(value, conn):
                 now = datetime.datetime.now()
-                value = db.get(k)
-                if value is None:
+                entry = db.get(k)
+                if entry is None:
+                    # Key truly missing
                     response = None
-                elif value.expiry is not None and now >= value.expiry:
+                elif entry.expiry is not None and now >= entry.expiry:
+                    # Expired
                     db.pop(k)
                     response = None
                 else:
-                    response = value.value
+                    val = entry.value
+                    if isinstance(val, (bytes, bytearray)):
+                        response = val
+                    elif isinstance(val, str):
+                        response = val.encode()
+                    else:
+                        # ✅ Empty string or unknown type → send empty bulk, not null bulk
+                        response = b""
         case [b"INFO", b"replication"]:
             if args.replicaof is None:
                 response = f"""\
