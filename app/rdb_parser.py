@@ -24,15 +24,30 @@ def read_file_and_construct_kvm(file_dir: str, file_name: str) -> Dict[Any, Valu
     global_file_dir = file_dir
     global_file_name = file_name
     try:
-        with open(file_dir+"/"+file_name, "rb") as f:
+        with open(file_dir + "/" + file_name, "rb") as f:
             buf = f.read()
             pos = 9  # Skip "REDIS0011" header
-            while buf[pos] != 0xFE:
-                # print(buf[pos])
-                pos += 1
-            pos += 5
 
-            while buf[pos] != 0xFF:
+            # Find database selector (0xFE)
+            while pos < len(buf) and buf[pos] != 0xFE:
+                pos += 1
+
+            if pos >= len(buf):
+                return {}
+
+            pos += 1  # Skip 0xFE
+
+            # Read database number (length-encoded)
+            db_number, pos = read_length(buf, pos)
+
+            # Skip the hash table size information (0xFB)
+            if pos < len(buf) and buf[pos] == 0xFB:
+                pos += 1
+                hash_table_size, pos = read_length(buf, pos)
+                expiry_hash_table_size, pos = read_length(buf, pos)
+
+            # Read key-value pairs
+            while pos < len(buf) and buf[pos] != 0xFF:
                 # Check for expiry first
                 expiry_type, expiry_value, pos = read_expiry(buf, pos)
 
@@ -45,18 +60,19 @@ def read_file_and_construct_kvm(file_dir: str, file_name: str) -> Dict[Any, Valu
                 key, pos = read_string(buf, pos)
                 val, pos = read_string(buf, pos)
 
-                entry =  Value(value=val.decode(), expiry=None)
+                entry = Value(value=val.decode(), expiry=None)
 
                 if expiry_type:
-                    # print(expiry_type)
-                    if expiry_type =="ms":
-                        expiry_value /= 1000 # type: ignore
-                    entry.expiry = expiry_value
+                    if expiry_type == "ms":
+                        expiry_value /= 1000  # type: ignore
+                    entry.expiry = datetime.datetime.fromtimestamp(expiry_value)  # Fixed this line
 
                 rdb_dict[key.decode()] = entry
         return rdb_dict
     except Exception as e:
-        print(e)
+        print(f"Error reading RDB file: {e}")
+        import traceback
+        traceback.print_exc()
         return {}
 
 
