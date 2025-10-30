@@ -291,15 +291,13 @@ def handle_command(
                 now = datetime.datetime.now()
                 db_val = db.get(k)
                 if db_val is None:
-                    # ✅ Return empty bulk string ($0\r\n\r\n) instead of null bulk ($-1\r\n)
-                    response = b"$0\r\n\r\n"
+                    response = None  # ✅ Let encoder output $-1\r\n
                 elif db_val.expiry is not None and now >= db_val.expiry:
                     db.pop(k)
-                    response = b"$0\r\n\r\n"
+                    response = None  # ✅ Expired keys also null bulk
                 else:
                     val = db_val.value
-                    # Always return proper bulk string
-                    response = b"$" + str(len(val)).encode() + b"\r\n" + val + b"\r\n"
+                    response = val  # ✅ return bytes directly (encoder handles it)
         case [b"INFO", b"replication"]:
             if args.replicaof is None:
                 response = f"""\
