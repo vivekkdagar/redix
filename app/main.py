@@ -289,15 +289,14 @@ def handle_command(
         case [b"GET", k]:
             if not queue_transaction(value, conn):
                 now = datetime.datetime.now()
-                db_val = db.get(k)
-                if db_val is None:
-                    response = None  # ✅ Let encoder output $-1\r\n
-                elif db_val.expiry is not None and now >= db_val.expiry:
+                value = db.get(k)
+                if value is None:
+                    response = None
+                elif value.expiry is not None and now >= value.expiry:
                     db.pop(k)
-                    response = None  # ✅ Expired keys also null bulk
+                    response = None
                 else:
-                    val = db_val.value
-                    response = val  # ✅ return bytes directly (encoder handles it)
+                    response = value.value
         case [b"INFO", b"replication"]:
             if args.replicaof is None:
                 response = f"""\
@@ -945,4 +944,4 @@ if __name__ == "__main__":
         dbfilename=parsed_args.dbfilename
     )
 
-    main(args)
+main(args)
