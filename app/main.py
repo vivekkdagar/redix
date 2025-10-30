@@ -289,28 +289,14 @@ def handle_command(
         case [b"GET", k]:
             if not queue_transaction(value, conn):
                 now = datetime.datetime.now()
-                key_str = k.decode() if isinstance(k, (bytes, bytearray)) else k
-                db_value = db.get(key_str) or db.get(k)
-
+                db_value = db.get(k)  # Changed variable name to avoid confusion
                 if db_value is None:
-                    # Key not found
                     response = None
                 elif db_value.expiry is not None and now >= db_value.expiry:
-                    # Expired
-                    db.pop(key_str, None)
+                    db.pop(k)
                     response = None
                 else:
-                    val = db_value.value
-                    # Handle possible RDB-loaded strings (they are stored as str)
-                    if isinstance(val, str):
-                        response = val.encode()
-                    elif isinstance(val, bytes):
-                        response = val
-                    elif val is None:
-                        response = None
-                    else:
-                        # Convert any other type (e.g. int, float) to string bytes
-                        response = str(val).encode()
+                    response = db_value.value
         case [b"INFO", b"replication"]:
             if args.replicaof is None:
                 response = f"""\
@@ -364,7 +350,14 @@ master_repl_offset:{replication.master_repl_offset}
                     response = "string"
             else:
                 response = "none"
-
+        case [b"KEYS", pattern]:
+            # Only '*' supported for now
+            if pattern == b"*":
+                # Return all keys as bytes
+                response = [k.encode() if isinstance(k, str) else k for k in db.keys()]
+            else:
+                # Optional: support limited pattern matching later
+                response = []
         case [b'LLEN', k]:
             if k in db.keys():
                 response = len(db[k].value)
