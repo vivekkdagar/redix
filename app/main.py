@@ -15,7 +15,7 @@ PSYNC_COMMAND_RESP = b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n"
 # In main.py, define this new function after connect_to_master or at the top level
 def replica_command_listener(master_socket: socket.socket):
     """Listens on the master-replica connection for propagated commands."""
-    while True:
+    while True: #hi
         try:
             # Propagated commands are RESP arrays.
             # We pass the master_socket as the 'client' to handle_command.
