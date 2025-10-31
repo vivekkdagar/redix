@@ -8,7 +8,7 @@ import math
 import argparse
 from xmlrpc import client
 from .parser import parsed_resp_array
-from .datastore import BLOCKING_CLIENTS, BLOCKING_CLIENTS_LOCK, BLOCKING_STREAMS, BLOCKING_STREAMS_LOCK, \
+from datastore import BLOCKING_CLIENTS, BLOCKING_CLIENTS_LOCK, BLOCKING_STREAMS, BLOCKING_STREAMS_LOCK, \
     CHANNEL_SUBSCRIBERS, DATA_LOCK, DATA_STORE, SORTED_SETS, STREAMS, WAIT_CONDITION, WAIT_LOCK, \
     _serialize_command_to_resp_array, add_to_sorted_set, cleanup_blocked_client, enqueue_client_command, \
     get_client_queued_commands, get_sorted_set_range, get_sorted_set_rank, get_stream_max_id, get_zscore, \
