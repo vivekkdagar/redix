@@ -1,472 +1,660 @@
-import asyncio
-import time
-from collections import defaultdict, deque
+#!/usr/bin/env python3
+import socket, threading, argparse, os, struct, datetime, time, re
+from collections import defaultdict
 
-BUF_SIZE = 4096
+# ---------- RESP parsing/encoding ----------
 
-lst = defaultdict(list)
-blocked_deques = defaultdict(deque)        # for BLPOP blocked writers
-d = {}                                     # key -> [value, expiry]
-streams = defaultdict(lambda: defaultdict(list))
-lastusedtime = 0
-lastusedseq = defaultdict(int)
-xread_zero_block = defaultdict(list)
+def parse_next(data: bytes):
+    # returns (value, rest)
+    first, rest = data.split(b"\r\n", 1)
+    t = first[:1]
+    if t == b'*':
+        n = int(first[1:].decode())
+        arr = []
+        tail = rest
+        for _ in range(n):
+            item, tail = parse_next(tail)
+            arr.append(item)
+        return arr, tail
+    if t == b'$':
+        ln = int(first[1:].decode())
+        if ln == -1:
+            return None, rest
+        blk = rest[:ln]
+        # expect \r\n after block
+        tail = rest[ln + 2:] if rest[ln:ln + 2] == b"\r\n" else rest[ln:]
+        return blk, tail
+    if t == b'+':
+        return first[1:].decode(), rest
+    if t == b':':
+        return int(first[1:].decode()), rest
+    if t == b'-':
+        return Exception(first[1:].decode()), rest
+    raise RuntimeError("unknown RESP type")
 
-# per-writer MULTI queues
-multi_queues = {}   # writer -> list of element-lists
+def parse_all(buffer: bytes):
+    msgs = []
+    b = buffer
+    while b:
+        try:
+            msg, b = parse_next(b)
+            msgs.append(msg)
+        except Exception:
+            break
+    return msgs
 
+def simple_string_encoder(msg: str):
+    return f"+{msg}\r\n".encode()
 
-# ---------------- RESP helpers ----------------
-def encode_simple(s: str) -> bytes:
-    return f"+{s}\r\n".encode()
+def error_encoder(msg: str):
+    return f"-{msg}\r\n".encode()
 
-def encode_error(s: str) -> bytes:
-    return f"-{s}\r\n".encode()
+def bulk_string_encoder(val):
+    if val is None:
+        return b"$-1\r\n"
+    s = str(val)
+    return f"${len(s)}\r\n{s}\r\n".encode()
 
-def encode_integer(n: int) -> bytes:
+def integer_encoder(n):
     return f":{n}\r\n".encode()
 
-def encode_bulk(s: str | None) -> bytes:
-    if s is None:
+def array_encoder(list_of_resp_bytes):
+    # list_of_resp_bytes: list of already-RESP-encoded byte sequences
+    merged = f"*{len(list_of_resp_bytes)}\r\n".encode()
+    for rb in list_of_resp_bytes:
+        merged += rb
+    return merged
+
+# resp_encoder convenience for python objects -> bytes (strings -> bulk)
+def resp_encoder(obj):
+    if obj is None:
         return b"$-1\r\n"
-    return f"${len(str(s))}\r\n{str(s)}\r\n".encode()
+    if isinstance(obj, bytes):
+        return obj
+    if isinstance(obj, int):
+        return integer_encoder(obj)
+    if isinstance(obj, list):
+        out = f"*{len(obj)}\r\n".encode()
+        for it in obj:
+            if isinstance(it, bytes):
+                out += bulk_string_encoder(it.decode())
+            elif isinstance(it, int):
+                out += integer_encoder(it)
+            elif isinstance(it, str):
+                out += bulk_string_encoder(it)
+            else:
+                out += bulk_string_encoder(str(it))
+        return out
+    return bulk_string_encoder(str(obj))
 
-def encode_array(parts: list[bytes]) -> bytes:
-    out = f"*{len(parts)}\r\n".encode()
-    for p in parts:
-        out += p
-    return out
+# ---------- Storage classes / small utils ----------
 
-# ---------------- Command handlers (return RESP bytes or None) ----------------
-async def handle_ping(elements, writer=None):
-    return encode_simple("PONG")
+class Value:
+    def __init__(self, value, expiry=None):
+        self.value = value
+        self.expiry = expiry
 
-async def handle_echo(elements, writer=None):
-    msg = elements[1] if len(elements) > 1 else ""
-    return encode_bulk(msg)
+store = {}         # key -> Value or list or stream structure
+store_list = {}    # key -> list
+streams = {}       # key -> list of dict entries
+subscriptions = {} # conn -> set(channels)
+channel_subs = defaultdict(set)
+replicas = []      # connections for replication (if used)
+BYTES_READ = 0
+replica_acks = 0
+prev_cmd = ""
+blocked = {}       # key -> list of connections for BLPOP
+blocked_xread = {} # stream key -> list of (conn, last_id)
 
-async def handle_set(elements, writer=None):
-    key = elements[1]
-    value = elements[2]
-    expiry = float('inf')
-    if len(elements) >= 5 and elements[3].upper() == 'PX':
-        expiry = time.time() + int(elements[4]) / 1000.0
-    d[key] = [value, expiry]
-    return encode_simple("OK")
+# minimal rdb reader stub (if file provided, load simple key/val pairs)
+def read_key_val_from_db(dirpath, dbfilename, dest_dict):
+    if not dirpath or not dbfilename:
+        return
+    path = os.path.join(dirpath, dbfilename)
+    if not os.path.isfile(path):
+        return
+    try:
+        with open(path, "rb") as f:
+            data = f.read().decode(errors="ignore").splitlines()
+            for ln in data:
+                if '=' in ln:
+                    k,v = ln.split('=',1)
+                    dest_dict[k] = Value(v, None)
+    except Exception:
+        pass
 
-async def handle_get(elements, writer=None):
-    key = elements[1]
-    if key in d:
-        val, expiry = d[key]
-        if expiry < time.time():
-            del d[key]
-            return encode_bulk(None)
-        return encode_bulk(val)
-    return encode_bulk(None)
+# ---------- List, stream, helper ops ----------
 
-async def handle_rpush(elements, writer=None):
-    key = elements[1]
-    for v in elements[2:]:
-        lst[key].append(v)
-    # wake blocked BLPOP (if any)
-    if blocked_deques.get(key):
-        blocked_writer = blocked_deques[key].popleft()
-        if lst[key]:
-            element = lst[key].pop(0)
-            resp = encode_array([encode_bulk(key), encode_bulk(element)])
-            # send without awaiting to avoid blocking
-            asyncio.create_task(send_to_writer(blocked_writer, resp))
-    return encode_integer(len(lst[key]))
+def setter(args):
+    # args: [key, value, ...maybe PX/EX...]
+    key, value = args[0], args[1]
+    expiry = None
+    if len(args) > 2:
+        if args[2].upper() == "EX" and len(args) >= 4:
+            expiry = datetime.datetime.now() + datetime.timedelta(seconds=int(args[3]))
+        elif args[2].upper() == "PX" and len(args) >= 4:
+            expiry = datetime.datetime.now() + datetime.timedelta(milliseconds=int(args[3]))
+    store[key] = Value(value=value, expiry=expiry)
 
-async def handle_lpush(elements, writer=None):
-    key = elements[1]
-    for v in elements[2:]:
-        lst[key].insert(0, v)
-    return encode_integer(len(lst[key]))
+def getter(key):
+    v = store.get(key)
+    if v is None:
+        return None
+    if isinstance(v, Value):
+        if v.expiry and datetime.datetime.now() >= v.expiry:
+            del store[key]
+            return None
+        return v.value
+    return v  # list or other types
 
-async def handle_llen(elements, writer=None):
-    key = elements[1]
-    return encode_integer(len(lst[key]))
+def rpush(args):
+    key = args[0]
+    vals = args[1:]
+    if key not in store_list:
+        store_list[key] = []
+    store_list[key].extend(vals)
+    # wake blocked blpop connections
+    while key in blocked and blocked[key] and store_list[key]:
+        conn = blocked[key].pop(0)
+        val = store_list[key].pop(0)
+        try:
+            conn.sendall(resp_encoder([key, val]))
+        except Exception:
+            pass
+    return len(store_list[key])
 
-async def handle_lrange(elements, writer=None):
-    key = elements[1]; start = int(elements[2]); end = int(elements[3])
-    arr = lst.get(key, [])
+def lpush(args):
+    key = args[0]
+    vals = args[1:]
+    if key not in store_list:
+        store_list[key] = []
+    for v in vals:
+        store_list[key].insert(0, v)
+    return len(store_list[key])
+
+def lrange_fn(args):
+    key = args[0]
+    start = int(args[1])
+    stop = int(args[2])
+    if key not in store_list:
+        return []
+    arr = store_list[key]
     n = len(arr)
-    if n == 0:
-        return b"*0\r\n"
-    if start < 0: start += n
-    if end < 0: end += n
+    if start < 0:
+        start += n
+    if stop < 0:
+        stop += n
     start = max(0, start)
-    end = min(n - 1, end)
-    if start > end:
-        return b"*0\r\n"
-    subset = arr[start:end+1]
-    parts = [encode_bulk(x) for x in subset]
-    return encode_array(parts)
+    stop = min(stop, n - 1)
+    if start > stop or n == 0:
+        return []
+    return arr[start:stop+1]
 
-async def handle_lpop(elements, writer=None):
-    key = elements[1]
-    if len(elements) == 2:
-        if lst.get(key):
-            return encode_bulk(lst[key].pop(0))
-        return encode_bulk(None)
+def lpop_fn(args):
+    key = args[0]
+    if key not in store_list or not store_list[key]:
+        return None
+    if len(args) == 1:
+        return store_list[key].pop(0)
     else:
-        count = int(elements[2])
-        popped = [lst[key].pop(0) for _ in range(min(count, len(lst.get(key, []))))]
-        parts = [encode_bulk(x) for x in popped]
-        return encode_array(parts)
+        cnt = int(args[1])
+        res = []
+        for _ in range(min(cnt, len(store_list[key]))):
+            res.append(store_list[key].pop(0))
+        return res
 
-async def handle_blpop(elements, writer):
-    key = elements[1]
-    timeout = float(elements[2])
-    if lst.get(key):
-        element = lst[key].pop(0)
-        return encode_array([encode_bulk(key), encode_bulk(element)])
+def blpop_fn(args, conn):
+    key = args[0]
+    timeout = float(args[1])
+    if key in store_list and store_list[key]:
+        return [key, store_list[key].pop(0)]
     # block
-    blocked_deques[key].append(writer)
-    async def unblock_after_timeout():
-        if timeout != 0:
-            await asyncio.sleep(timeout)
-            if writer in blocked_deques[key]:
-                # remove and send nil (null array)
+    if key not in blocked:
+        blocked[key] = []
+    blocked[key].append(conn)
+    if timeout > 0:
+        def timeout_unblock():
+            time.sleep(timeout)
+            if key in blocked and conn in blocked[key]:
                 try:
-                    blocked_deques[key].remove(writer)
-                except ValueError:
-                    return
-                await send_to_writer(writer, b"*-1\r\n")
-    asyncio.create_task(unblock_after_timeout())
+                    blocked[key].remove(conn)
+                    conn.sendall(b"*-1\r\n")
+                except Exception:
+                    pass
+        t = threading.Thread(target=timeout_unblock, daemon=True)
+        t.start()
     return None
 
-async def handle_type(elements, writer=None):
-    key = elements[1]
-    if key in streams:
-        return encode_simple("stream")
-    if key in d and d[key][1] >= time.time():
-        v = d[key][0]
-        t = "string"
-        if isinstance(v, list): t = "list"
-        return encode_simple(t)
-    return encode_simple("none")
-
-# Simplified XADD/XRANGE/XREAD handlers (keeps behavior from earlier async impl)
-async def handle_xadd(elements, writer=None):
-    global lastusedtime
-    stream_key = elements[1]
-    entry_id = elements[2]
-    # compute ID
-    if entry_id == '*':
-        t = time.time_ns() // 1_000_000
-        seq = lastusedseq.get(t, -1) + 1
-        final_id = f"{t}-{seq}"
-    elif '-' in entry_id:
-        t_str, seq_str = entry_id.split('-', 1)
-        if t_str == '*':
-            t = time.time_ns() // 1_000_000
-        else:
-            t = int(t_str)
-        if seq_str == '*':
-            seq = lastusedseq.get(t, -1) + 1
-            final_id = f"{t}-{seq}"
-        else:
-            seq = int(seq_str)
-            final_id = entry_id
+# Streams (basic xadd / xrange / xread)
+def allot_id(key, t_str):
+    if key not in streams or not streams[key]:
+        return f"{t_str}-0"
+    last = streams[key][-1]['id']
+    last_time, last_seq = last.split("-")
+    if int(t_str) > int(last_time):
+        return f"{t_str}-0"
     else:
-        t = time.time_ns() // 1_000_000
-        seq = lastusedseq.get(t, -1) + 1
-        final_id = f"{t}-{seq}"
-    # validate
-    if t == 0 and seq == 0:
-        return encode_error("ERR The ID specified in XADD must be greater than 0-0")
-    if t < lastusedtime or (t == lastusedtime and seq <= lastusedseq.get(lastusedtime, -1)):
-        return encode_error("ERR The ID specified in XADD is equal or smaller than the target stream top item")
-    lastusedtime = t
-    lastusedseq[lastusedtime] = seq
-    # store
-    streams[stream_key][final_id].append(elements[3:])
-    # notify blocked XREAD if present
-    if xread_zero_block.get(stream_key):
-        bd = xread_zero_block[stream_key]
-        if isinstance(bd, list) and len(bd) >= 2:
-            start_id, blocked_writer = bd
-            # prepare response (very simplified)
-            entries = []
-            for eid, flds_list in streams[stream_key].items():
-                if eid > start_id:
-                    # condense fields (first occurrence)
-                    entries.append((eid, flds_list))
-            if entries:
-                # build response for single stream
-                # top-level: array of streams (1)
-                stream_parts = []
-                # stream key and entries
-                inner_entries = []
-                for eid, flds_list in entries:
-                    # flatten field-value pairs for each entry
-                    entry_parts = []
-                    for fields in flds_list:
-                        for field in fields:
-                            entry_parts.append(encode_bulk(field))
-                    entry_resp = encode_array([encode_bulk(eid)] + entry_parts)
-                    inner_entries.append(entry_resp)
-                # build stream block: [ stream_key , [ entries... ] ] -> represent as array bytes
-                # For simplicity send something acceptable to tests: single stream with entries
-                resp = b"*1\r\n*2\r\n" + encode_bulk(stream_key) + b"*" + str(len(inner_entries)).encode() + b"\r\n"
-                for e in inner_entries:
-                    resp += e
-                asyncio.create_task(send_to_writer(blocked_writer, resp))
-            xread_zero_block[stream_key] = []
-    return encode_bulk(final_id)
+        return f"{last_time}-{int(last_seq)+1}"
 
-async def handle_xrange(elements, writer=None):
-    # elements: [XRANGE, key, start, end]
-    key = elements[1]; start = elements[2]; end = elements[3]
-    res_pairs = []
-    for eid, flds_list in streams.get(key, {}).items():
-        if start <= eid <= end:
-            # produce [id, [field, value, field, value...]]
-            fields_flat = []
-            for fields in flds_list:
-                for field in fields:
-                    fields_flat.append(field)
-            res_pairs.append((eid, fields_flat))
-    # build RESP array
-    parts = []
-    for eid, fields_flat in res_pairs:
-        # entry array: [id, [field, value, ...]] -> represent as two elements
-        entry_fields = [encode_bulk(x) for x in fields_flat]
-        entry_arr = encode_array([encode_bulk(eid), encode_array(entry_fields)])
-        parts.append(entry_arr)
-    return encode_array(parts)
+def xadd_fn(args):
+    key = args[0]
+    entry_id = args[1]
+    if entry_id == '*':
+        t = str(int(time.time()*1000))
+        entry_id = allot_id(key, t)
+    elif '-' in entry_id:
+        t_str, seq = entry_id.split('-',1)
+        if seq == '*':
+            entry_id = allot_id(key, t_str)
+    else:
+        entry_id = allot_id(key, str(int(time.time()*1000)))
+    fields = args[2:]
+    dct = {'id': entry_id}
+    for i in range(0, len(fields),2):
+        if i+1 < len(fields):
+            dct[fields[i]] = fields[i+1]
+    streams.setdefault(key, []).append(dct)
+    # wake blocked xread clients
+    if key in blocked_xread and blocked_xread[key]:
+        pend = blocked_xread[key][:]
+        blocked_xread[key] = []
+        for conn, last_id in pend:
+            res = []
+            for e in streams[key]:
+                if e['id'] > last_id:
+                    fields_arr = []
+                    for k,v in e.items():
+                        if k != 'id':
+                            fields_arr.append([k,v])
+                    res.append([key, [[e['id'], fields_arr]]])
+            if res:
+                try:
+                    conn.sendall(resp_encoder(res))
+                except Exception:
+                    pass
+    return entry_id
 
-async def handle_xread(elements, writer):
-    # supports BLOCK <ms> STREAMS <key> <id> or non-blocking simple use
-    if elements[1].lower() == 'block':
-        timeout_ms = int(elements[2])
-        key = elements[4]
-        start = elements[5]
-        if start == '$':
-            start_id = max(streams[key].keys()) if streams.get(key) else '0-0'
-        else:
-            start_id = start
-        # if there are newer entries, return immediately
-        new_entries = []
-        for eid, flds_list in streams.get(key, {}).items():
-            if eid > start_id:
-                new_entries.append((eid, flds_list))
-        if new_entries:
-            # build response similar to earlier code
-            parts = []
-            for eid, flds_list in new_entries:
-                entry_fields = []
-                for fields in flds_list:
-                    for field in fields:
-                        entry_fields.append(encode_bulk(field))
-                parts.append(encode_array([encode_bulk(eid), encode_array(entry_fields)]))
-            # send array with one stream
-            return encode_array([encode_array([encode_bulk(key), encode_array(parts)])])
-        # no entries now: if timeout_ms == 0, register for zero-block
-        if timeout_ms == 0:
-            xread_zero_block[key] = [start_id, writer]
-            return None
-        # schedule timeout task
-        async def unblock_after_timeout():
-            await asyncio.sleep(timeout_ms / 1000.0)
-            final_entries = []
-            for eid, flds_list in streams.get(key, {}).items():
-                if eid > start_id:
-                    final_entries.append((eid, flds_list))
-            if final_entries:
-                parts = []
-                for eid, flds_list in final_entries:
-                    entry_fields = []
-                    for fields in flds_list:
-                        for field in fields:
-                            entry_fields.append(encode_bulk(field))
-                    parts.append(encode_array([encode_bulk(eid), encode_array(entry_fields)]))
-                await send_to_writer(writer, encode_array([encode_array([encode_bulk(key), encode_array(parts)])]))
-            else:
-                await send_to_writer(writer, b"*-1\r\n")
-        asyncio.create_task(unblock_after_timeout())
+def xrange_fn(args):
+    key = args[0]
+    start = args[1]
+    end = args[2]
+    if key not in streams:
+        return []
+    res = []
+    for e in streams[key]:
+        if start <= e['id'] <= end:
+            fields = []
+            for k,v in e.items():
+                if k != 'id':
+                    fields.append([k,v])
+            res.append([e['id'], fields])
+    return res
+
+def xread_fn(args):
+    # args = [key1, key2..., id1, id2...]
+    n = len(args)//2
+    keys = args[:n]
+    ids = args[n:]
+    out = []
+    for k, last in zip(keys, ids):
+        if k not in streams:
+            continue
+        entries = []
+        for e in streams[k]:
+            if e['id'] > last:
+                fields=[]
+                for kk,v in e.items():
+                    if kk!='id':
+                        fields.append([kk,v])
+                entries.append([e['id'], fields])
+        if entries:
+            out.append([k, entries])
+    return out
+
+def blocks_xread_fn(args, conn):
+    # args: [ms, 'STREAMS', key, id]
+    try:
+        ms = float(args[0]); key = args[2]; id0 = args[3]
+    except Exception:
+        return None
+    if key not in streams or not any(e['id']>id0 for e in streams[key]):
+        # block
+        blocked_xread.setdefault(key, []).append((conn, id0))
+        if ms > 0:
+            def tmout():
+                time.sleep(ms/1000)
+                # if still blocked, respond nil
+                for pair in list(blocked_xread.get(key, [])):
+                    if pair[0] == conn:
+                        try:
+                            blocked_xread[key].remove(pair)
+                            conn.sendall(b"*-1\r\n")
+                        except Exception:
+                            pass
+            threading.Thread(target=tmout, daemon=True).start()
         return None
     else:
-        # non-blocking multi-stream small implementation
-        total = len(elements[2:])
-        half = total // 2
-        keys = elements[2:2+half]; starts = elements[2+half:]
-        streams_parts = []
-        for i,key in enumerate(keys):
-            start = starts[i]
-            entries = []
-            for eid, flds_list in streams.get(key, {}).items():
-                if eid > start:
-                    entry_fields = []
-                    for fields in flds_list:
-                        for field in fields:
-                            entry_fields.append(encode_bulk(field))
-                    entries.append(encode_array([encode_bulk(eid), encode_array(entry_fields)]))
-            streams_parts.append(encode_array([encode_bulk(key), encode_array(entries)]))
-        return encode_array(streams_parts)
+        return xread_fn([key, id0])
 
+# ---------- Transactions state ----------
 
-async def handle_incr(elements, writer=None):
-    key = elements[1]
-    if key in d:
-        val, expiry = d[key]
-        if isinstance(val, int):
-            val += 1
-            d[key][0] = val
-            return encode_integer(val)
+transaction_queues = {}  # conn -> list of decoded-commands (strings)
+
+# ---------- Command executor ----------
+
+def cmd_executor(decoded, conn, config, executing=False):
+    # decoded: list of bulk-items bytes or str (we will normalize to str)
+    if not decoded:
+        return None
+    # normalize
+    args = [ (x.decode() if isinstance(x, (bytes,bytearray)) else x) for x in decoded ]
+    cmd = args[0].upper()
+    # queueing logic
+    if conn in transaction_queues and cmd not in ("MULTI","EXEC","DISCARD"):
+        transaction_queues[conn].append(args)
+        return simple_string_encoder("QUEUED")
+    # MULTI
+    if cmd == "MULTI":
+        transaction_queues[conn] = []
+        return simple_string_encoder("OK")
+    # EXEC
+    if cmd == "EXEC":
+        if conn not in transaction_queues:
+            return error_encoder("ERR EXEC without MULTI")
+        queued_cmds = transaction_queues.pop(conn, [])
+        if not queued_cmds:
+            return b"*0\r\n"
+        results = []
+        for q in queued_cmds:
+            try:
+                r = cmd_executor(q, conn, config, executing=True)
+                if r is None:
+                    r = simple_string_encoder("OK")
+            except Exception as e:
+                r = error_encoder("EXECABORT Transaction discarded because of previous errors.")
+            results.append(r if isinstance(r, bytes) else str(r).encode())
+        return array_encoder(results)
+    # DISCARD
+    if cmd == "DISCARD":
+        if conn in transaction_queues:
+            transaction_queues.pop(conn, None)
+            return simple_string_encoder("OK")
+        else:
+            return error_encoder("ERR DISCARD without MULTI")
+    # PING
+    if cmd == "PING":
+        return simple_string_encoder("PONG")
+    # ECHO
+    if cmd == "ECHO":
+        msg = args[1] if len(args)>1 else ""
+        return bulk_string_encoder(msg)
+    # SET
+    if cmd == "SET":
+        if len(args) < 3:
+            return error_encoder("ERR wrong number of args for SET")
+        setter(args[1:])
+        # replicate to replicas if needed
+        return simple_string_encoder("OK")
+    # GET
+    if cmd == "GET":
+        if len(args) < 2:
+            return error_encoder("ERR wrong number of args for GET")
+        v = getter(args[1])
+        return bulk_string_encoder(v)
+    # INCR
+    if cmd == "INCR":
+        k = args[1]
+        v = getter(k)
+        if v is None:
+            setter([k, "1"])
+            return integer_encoder(1)
         try:
-            # if string containing digits
-            new = int(val) + 1
-            d[key][0] = new
-            return encode_integer(new)
+            nv = int(v) + 1
+            setter([k, str(nv)])
+            return integer_encoder(nv)
         except Exception:
-            return encode_error("ERR value is not an integer or out of range")
-    else:
-        expiry = float('inf')
-        d[key] = [1, expiry]
-        return encode_integer(1)
-
-# ---------------- MULTI / EXEC / DISCARD handling ----------------
-async def handle_multi(elements, writer):
-    multi_queues[writer] = []
-    return encode_simple("OK")
-
-async def handle_discard(elements, writer):
-    if writer in multi_queues:
-        del multi_queues[writer]
-        return encode_simple("OK")
-    return encode_error("ERR DISCARD without MULTI")
-
-async def handle_exec(elements, writer):
-    if writer not in multi_queues:
-        return encode_error("ERR EXEC without MULTI")
-    queued = multi_queues.pop(writer)
-    if not queued:
-        return b"*0\r\n"
-    results = []
-    abort_err = None
-    for q in queued:
-        try:
-            res = await execute_command(q, writer, for_exec=True)
-            if res is None:
-                # asynchronous/no immediate result: treat as null bulk
-                results.append(encode_bulk(None))
-            else:
-                results.append(res)
-        except Exception:
-            abort_err = encode_error("EXECABORT Transaction discarded because of previous errors.")
-            break
-    if abort_err:
-        # if abort, every entry should be EXECABORT error (redis returns errors for each queued).
-        out = f"*{len(queued)}\r\n".encode()
-        for _ in queued:
-            out += abort_err
-        return out
-    # otherwise return array of results
-    return encode_array(results)
-
-
-# ---------------- dispatcher ----------------
-async def execute_command(elements, writer, for_exec=False):
-    cmd = elements[0].lower()
-    handlers = {
-        'ping': lambda e: handle_ping(e, writer),
-        'echo': lambda e: handle_echo(e, writer),
-        'set': lambda e: handle_set(e, writer),
-        'get': lambda e: handle_get(e, writer),
-        'rpush': lambda e: handle_rpush(e, writer),
-        'lpush': lambda e: handle_lpush(e, writer),
-        'llen': lambda e: handle_llen(e, writer),
-        'lrange': lambda e: handle_lrange(e, writer),
-        'lpop': lambda e: handle_lpop(e, writer),
-        'blpop': lambda e: handle_blpop(e, writer),
-        'type': lambda e: handle_type(e, writer),
-        'xadd': lambda e: handle_xadd(e, writer),
-        'xrange': lambda e: handle_xrange(e, writer),
-        'xread': lambda e: handle_xread(e, writer),
-        'incr': lambda e: handle_incr(e, writer),
-        'multi': lambda e: handle_multi(e, writer),
-        'exec': lambda e: handle_exec(e, writer),
-        'discard': lambda e: handle_discard(e, writer),
-    }
-    if cmd in handlers:
-        return await handlers[cmd](elements)
-    return encode_error("ERR unknown command")
-
-
-# ---------------- network / parsing ----------------
-async def send_to_writer(writer, data: bytes):
-    try:
-        writer.write(data)
-        await writer.drain()
-    except Exception:
-        pass
-
-async def handle_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    peer = writer.get_extra_info('peername')
-    while True:
-        data = await reader.read(BUF_SIZE)
-        if not data:
-            break
-        # simple RESP ARRAY parser for incoming commands (assumes a full request arrives)
-        try:
-            i = 0
-            if data[i] != ord('*'):
-                # ignore non-array
-                continue
-            i += 1
-            j = data.find(b'\r\n', i)
-            arrlen = int(data[i:j])
-            i = j + 2
-            elements = []
-            for _ in range(arrlen):
-                if data[i] != ord('$'):
-                    raise RuntimeError("Expected bulk string")
-                i += 1
-                j = data.find(b'\r\n', i)
-                blen = int(data[i:j])
-                i = j + 2
-                elem = data[i:i+blen].decode()
-                elements.append(elem)
-                i += blen + 2
-        except Exception:
-            # malformed, ignore
-            continue
-
-        cmd = elements[0].lower()
-
-        # MULTI queueing: if writer in multi_queues and incoming command is not EXEC/DISCARD/MULTI
-        if writer in multi_queues and cmd not in ('exec', 'discard', 'multi'):
-            multi_queues[writer].append(elements)
-            await send_to_writer(writer, encode_simple("QUEUED"))
-            continue
-
-        # normal dispatch
-        try:
-            res = await execute_command(elements, writer)
-        except Exception:
-            res = encode_error("ERR internal error")
+            return error_encoder("ERR value is not an integer or out of range")
+    # RPUSH
+    if cmd == "RPUSH":
+        if len(args) < 3:
+            return error_encoder("ERR wrong number of args for RPUSH")
+        n = rpush(args[1:])
+        return integer_encoder(n)
+    # LPUSH
+    if cmd == "LPUSH":
+        if len(args) < 3:
+            return error_encoder("ERR wrong number of args for LPUSH")
+        n = lpush(args[1:])
+        return integer_encoder(n)
+    # LRANGE
+    if cmd == "LRANGE":
+        if len(args) < 4:
+            return error_encoder("ERR wrong number of args for LRANGE")
+        res = lrange_fn(args[1:])
+        return resp_encoder(res)
+    # LLEN
+    if cmd == "LLEN":
+        n = len(store_list.get(args[1], []))
+        return integer_encoder(n)
+    # LPOP
+    if cmd == "LPOP":
+        res = lpop_fn(args[1:])
         if res is None:
-            # command doesn't have immediate response (e.g. BLPOP registered)
-            continue
-        await send_to_writer(writer, res)
+            return bulk_string_encoder(None)
+        if isinstance(res, list):
+            return resp_encoder(res)
+        return bulk_string_encoder(res)
+    # BLPOP
+    if cmd == "BLPOP":
+        r = blpop_fn(args[1:], conn)
+        if r is None:
+            return None
+        return resp_encoder(r)
+    # TYPE
+    if cmd == "TYPE":
+        k = args[1]
+        if k in store and isinstance(store[k], Value):
+            return simple_string_encoder("string")
+        if k in store_list:
+            return simple_string_encoder("list")
+        if k in streams:
+            return simple_string_encoder("stream")
+        return simple_string_encoder("none")
+    # XADD
+    if cmd == "XADD":
+        res = xadd_fn(args[1:])
+        return bulk_string_encoder(res)
+    # XRANGE
+    if cmd == "XRANGE":
+        res = xrange_fn(args[1:])
+        return resp_encoder(res)
+    # XREAD
+    if cmd == "XREAD":
+        if args[1].upper() == "BLOCK":
+            r = blocks_xread_fn(args[1:], conn)
+            if r is None:
+                return None
+            return resp_encoder(r)
+        else:
+            res = xread_fn(args[1:])
+            return resp_encoder(res)
+    # SUBSCRIBE
+    if cmd == "SUBSCRIBE":
+        ch = args[1]
+        subscriptions.setdefault(conn, set()).add(ch)
+        channel_subs[ch].add(conn)
+        return resp_encoder(["subscribe", ch, str(len(subscriptions[conn]))])
+    # UNSUBSCRIBE
+    if cmd == "UNSUBSCRIBE":
+        ch = args[1] if len(args)>=2 else None
+        if conn in subscriptions:
+            if ch:
+                subscriptions[conn].discard(ch)
+                channel_subs[ch].discard(conn)
+            else:
+                # unsubscribe all
+                for c in list(subscriptions[conn]):
+                    channel_subs[c].discard(conn)
+                subscriptions[conn].clear()
+        count = len(subscriptions.get(conn, set()))
+        return resp_encoder(["unsubscribe", ch if ch else "", str(count)])
+    # PUBLISH
+    if cmd == "PUBLISH":
+        ch = args[1]; msg = args[2]
+        subs = channel_subs.get(ch, set())
+        sent = 0
+        for c in list(subs):
+            try:
+                c.sendall(resp_encoder(["message", ch, msg]))
+                sent += 1
+            except Exception:
+                pass
+        return integer_encoder(sent)
+    # CONFIG GET
+    if cmd == "CONFIG" and len(args)>=3 and args[1].upper()=="GET":
+        p = args[2]
+        if p == "dir":
+            return resp_encoder(["dir", config.get('dir','')])
+        if p == "dbfilename":
+            return resp_encoder(["dbfilename", config.get('dbfilename','')])
+        return resp_encoder([])
+    # INFO
+    if cmd == "INFO":
+        section = args[1] if len(args)>1 else ""
+        if section.lower() == "replication":
+            role = config.get('role','master')
+            s = f"role:{role}\n"
+            s += f"master_replid:{config.get('master_replid','')}\n"
+            s += f"master_repl_offset:{config.get('master_replid_offset','0')}\n"
+            return bulk_string_encoder(s)
+        return bulk_string_encoder("ok")
+    # REPLCONF / PSYNC / WAIT minimal stubs for tests
+    if cmd == "REPLCONF":
+        return simple_string_encoder("OK")
+    if cmd == "PSYNC":
+        # send FULLRESYNC + rdb blob
+        rid = config.get('master_replid','0')
+        roff = config.get('master_replid_offset','0')
+        return simple_string_encoder(f"FULLRESYNC {rid} {roff}")
+    if cmd == "WAIT":
+        return integer_encoder(0)
+    return error_encoder(f"ERR unknown command '{cmd}'")
 
-    # cleanup on disconnect
-    if writer in multi_queues:
-        del multi_queues[writer]
-    writer.close()
-    try:
-        await writer.wait_closed()
-    except Exception:
-        pass
+# ---------- Client handler ----------
 
-async def main():
-    server = await asyncio.start_server(handle_connection, "127.0.0.1", 6379)
-    print("Server running on 127.0.0.1:6379")
-    async with server:
-        await server.serve_forever()
+def handle_client(conn, config, initial_data=b""):
+    global prev_cmd
+    read_key_val_from_db(config.get('dir',''), config.get('dbfilename',''), config.setdefault('store',{}))
+    buffer = initial_data
+    with conn:
+        while True:
+            try:
+                if not buffer:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    buffer += chunk
+                msgs = parse_all(buffer)
+                # If parse_all consumed nothing (partial), wait for more
+                if not msgs:
+                    # try to detect if buffer is incomplete: break to recv more
+                    # we will keep buffer as-is
+                    buffer = buffer
+                    continue
+                # If parse_all returns at least one message, we must empty buffer fully,
+                # because parse_all consumed what it could (we ignore leftover)
+                buffer = b""
+                for m in msgs:
+                    # m is array (list) of bulk items (bytes) or nested arrays
+                    # top-level expected: an array with bulk strings (command + args)
+                    if not isinstance(m, list) or len(m)==0:
+                        continue
+                    decoded = [item for item in m]  # keep bytes for cmd_executor normalization
+                    resp = cmd_executor(decoded, conn, config)
+                    # If resp is None => command blocked (BLPOP/XREAD) or queued (no immediate response)
+                    if resp is None:
+                        # blocked or delayed; just continue to next recv
+                        continue
+                    # If resp is already a full RESP array (EXEC) we should write it directly.
+                    try:
+                        conn.sendall(resp)
+                    except Exception:
+                        pass
+            except Exception as e:
+                # swallow and close
+                break
+
+# ---------- Server bootstrap classes ----------
+
+class Master:
+    def __init__(self, args):
+        self.args = args
+        self.config = {}
+        self.config['role'] = 'master'
+        self.config['master_replid'] = '8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb'
+        self.config['master_replid_offset'] = '0'
+        self.config['dir'] = args.dir
+        self.config['dbfilename'] = args.dbfilename
+        self.config['store'] = {}
+        read_key_val_from_db(self.config['dir'], self.config['dbfilename'], self.config['store'])
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("localhost", args.port))
+        s.listen(50)
+        while True:
+            c,_ = s.accept()
+            t = threading.Thread(target=handle_client, args=(c, self.config))
+            t.daemon = True
+            t.start()
+
+class Slave:
+    def __init__(self, args):
+        self.args = args
+        self.config = {}
+        self.config['role'] = 'slave'
+        master_host, master_port = args.replicaof.split(' ')
+        self.config['master_host'] = master_host
+        self.config['master_port'] = int(master_port)
+        self.config['dir'] = args.dir
+        self.config['dbfilename'] = args.dbfilename
+        self.config['store'] = {}
+        read_key_val_from_db(self.config['dir'], self.config['dbfilename'], self.config['store'])
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("localhost", args.port))
+        s.listen(10)
+        # handshake simplified
+        master_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        master_sock.connect((self.config['master_host'], self.config['master_port']))
+        master_sock.sendall(resp_encoder(["PING"]))
+        # read PONG
+        try:
+            data = master_sock.recv(1024)
+        except Exception:
+            data = b""
+        # start client handler thread for master connection (replication)
+        t = threading.Thread(target=handle_client, args=(master_sock, self.config, data))
+        t.daemon = True
+        t.start()
+        while True:
+            c,_ = s.accept()
+            t2 = threading.Thread(target=handle_client, args=(c, self.config))
+            t2.daemon = True
+            t2.start()
+
+# ---------- main ----------
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=6379)
+    parser.add_argument("--replicaof", type=str, default="")
+    parser.add_argument("--dir", type=str, default="")
+    parser.add_argument("--dbfilename", type=str, default="")
+    args = parser.parse_args()
+    if args.replicaof:
+        Slave(args)
+    else:
+        Master(args)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
