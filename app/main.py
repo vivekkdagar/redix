@@ -481,49 +481,49 @@ def cmd_executor(decoded, conn, config, executing=False):
     # SUBSCRIBE
     # SUBSCRIBE
     # --- SUBSCRIBE ---
-    elif cmd == "SUBSCRIBE":
-        SUBSCRIBE = 1
+    # --- SUBSCRIBE ---
+    elif decoded_data[0].upper() == "SUBSCRIBE":
+        channel_names = decoded_data[1:]
+        if not channel_names:
+            channel_names = [""]  # Redis still replies when no channels specified
+
         if connection not in subscriptions:
             subscriptions[connection] = set()
 
-        responses = []
-        for ch in args:
-            subscriptions[connection].add(ch)
+        for channel in channel_names:
+            subscriptions[connection].add(channel)
+            count = len(subscriptions[connection])
             resp = (
-                f"*3\r\n$9\r\nsubscribe\r\n"
-                f"${len(ch)}\r\n{ch}\r\n"
-                f":{len(subscriptions[connection])}\r\n"
+                f"*3\r\n"
+                f"$9\r\nsubscribe\r\n"
+                f"${len(channel)}\r\n{channel}\r\n"
+                f":{count}\r\n"
             ).encode()
-            responses.append(resp)
+            connection.sendall(resp)
 
-        for r in responses:
-            connection.sendall(r)
+        SUBSCRIBE = 1
         return [], queued
 
 
     # --- UNSUBSCRIBE ---
-    elif cmd == "UNSUBSCRIBE":
+    elif decoded_data[0].upper() == "UNSUBSCRIBE":
         if connection not in subscriptions:
             subscriptions[connection] = set()
 
-        responses = []
-        channels = args if args else list(subscriptions[connection])
-        if not channels:
-            channels = [""]  # unsubscribing from all but none exist
+        # If no channels given, unsubscribe from all
+        channels = decoded_data[1:] or list(subscriptions[connection]) or [""]
 
-        for ch in channels:
-            if ch in subscriptions[connection]:
-                subscriptions[connection].remove(ch)
+        for channel in channels:
+            if channel in subscriptions[connection]:
+                subscriptions[connection].remove(channel)
             count = len(subscriptions[connection])
             resp = (
-                f"*3\r\n$11\r\nunsubscribe\r\n"
-                f"${len(ch)}\r\n{ch}\r\n"
+                f"*3\r\n"
+                f"$11\r\nunsubscribe\r\n"
+                f"${len(channel)}\r\n{channel}\r\n"
                 f":{count}\r\n"
             ).encode()
-            responses.append(resp)
-
-        for r in responses:
-            connection.sendall(r)
+            connection.sendall(resp)
 
         if not subscriptions[connection]:
             del subscriptions[connection]
