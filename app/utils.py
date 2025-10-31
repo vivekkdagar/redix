@@ -1,6 +1,6 @@
 import time
 import threading
-from app.resp import resp_encoder
+from app.parser import resp_encoder
 
 #####################    LIST OPERATIONS     #####################
 store = {}
