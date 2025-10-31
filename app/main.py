@@ -384,7 +384,7 @@ master_repl_offset:{replication.master_repl_offset}
                 else:
                     response = "string"
             else:
-                response = "none"
+                response = "none"#type
 
         case [b'LLEN', k]:
             if k in db.keys():
