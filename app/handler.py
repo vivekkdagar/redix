@@ -48,8 +48,13 @@ def cmd_executor(decoded_data, connection, config, executing=False):
     queued = False
 
     # --- Queueing inside MULTI ---
+    # --- Transaction queuing logic ---
     if connection in transaction_queues and cmd not in ["MULTI", "EXEC", "DISCARD"]:
-        transaction_queues[connection].append(decoded_data)
+        # decode all to str before queueing
+        transaction_queues[connection].append([
+            x.decode() if isinstance(x, (bytes, bytearray)) else x
+            for x in decoded_data
+        ])
         response = simple_string_encoder("QUEUED")
         if executing:
             return response, True
@@ -68,7 +73,8 @@ def cmd_executor(decoded_data, connection, config, executing=False):
             connection.sendall(error_encoder("ERR EXEC without MULTI"))
             return [], False
 
-        queued_cmds = transaction_queues.pop(connection)
+        queued_cmds = transaction_queues.pop(connection, [])
+
         if not queued_cmds:
             connection.sendall(b"*0\r\n")
             return [], False
@@ -81,32 +87,14 @@ def cmd_executor(decoded_data, connection, config, executing=False):
                 res = error_encoder("EXECABORT Transaction discarded because of previous errors.")
 
             if res is None:
-                qcmd = queued[0].upper()
-                if qcmd == "SET":
-                    res = simple_string_encoder("OK")
-                elif qcmd in ("INCR", "DECR"):
-                    val = db.get(queued[1])
-                    num = int(val.value) if isinstance(val, Value) else 0
-                    res = integer_encoder(num)
-                elif qcmd == "GET":
-                    val = db.get(queued[1])
-                    if val is None or (val.expiry and datetime.datetime.now() >= val.expiry):
-                        res = bulk_string_encoder(None)
-                    else:
-                        res = bulk_string_encoder(val.value)
-                else:
-                    res = simple_string_encoder("OK")
+                res = simple_string_encoder("OK")
+
             results.append(res)
 
+        # Combine into single RESP array
         merged = f"*{len(results)}\r\n".encode()
         for r in results:
-            if isinstance(r, bytes):
-                merged += r
-            elif isinstance(r, str):
-                merged += r.encode()
-            else:
-                merged += simple_string_encoder("OK")
-
+            merged += r if isinstance(r, bytes) else r.encode()
         connection.sendall(merged)
         return [], False
 
