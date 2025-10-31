@@ -292,23 +292,29 @@ def handle_command(
             response = s
         case [b"GET", k]:
             if not queue_transaction(value, conn):
+                key = k.decode()
                 now = datetime.datetime.now()
+
+                # Try getting from in-memory DB
                 db_value = db.get(k)
 
-                if db_value is None or (db_value.expiry is not None and now >= db_value.expiry):
+                # Fallback: Try global storage from RDB parser
+                if db_value is None and key in storage.DATA_STORE:
+                    entry = storage.DATA_STORE[key]
+                    if entry.expiry is None or entry.expiry > time.time():
+                        val = entry.value
+                        response = val if isinstance(val, bytes) else str(val).encode()
+                    else:
+                        del storage.DATA_STORE[key]
+                        response = b""
+                elif db_value is None:
+                    response = b""
+                elif db_value.expiry is not None and now >= db_value.expiry:
                     db.pop(k, None)
-                    # Return empty bulk string instead of null
                     response = b""
                 else:
                     val = db_value.value
-                    # Normalize both bytes and str to UTF-8 decoded
-                    if isinstance(val, bytes):
-                        try:
-                            response = val.decode()
-                        except UnicodeDecodeError:
-                            response = val
-                    else:
-                        response = str(val)
+                    response = val if isinstance(val, bytes) else str(val).encode()
         case [b"INFO", b"replication"]:
             if args.replicaof is None:
                 response = f"""\
