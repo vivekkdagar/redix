@@ -3,8 +3,6 @@ import io
 import time
 import datetime
 import traceback
-import app.storage as storage
-from app.storage import DataEntry
 import dataclasses
 from typing import Any, Dict, Optional, List
 
@@ -22,6 +20,7 @@ OPCODE_AUX = 0xfa
 
 # --- Value Types ---
 VALUE_TYPE_STRING = 0
+
 
 @dataclasses.dataclass
 class XADDValue:
@@ -84,7 +83,6 @@ class RdbParser:
             return self.read_bytes(length)
 
     def parse(self) -> Dict[str, Value]:
-        # Verify magic
         magic = self.read_bytes(5)
         if magic != b"REDIS":
             raise ValueError("Invalid RDB header")
@@ -100,28 +98,23 @@ class RdbParser:
                 print("Reached EOF marker.")
                 break
             elif opcode == OPCODE_AUX:
-                key = self.read_string().decode()
-                value = self.read_string().decode()
-                print(f"AUX field: {key}={value}")
+                _ = self.read_string()
+                _ = self.read_string()
             elif opcode == OPCODE_SELECTDB:
-                db_num, _ = self.read_length_encoded()
-                print(f"Selecting DB {db_num}")
+                _, _ = self.read_length_encoded()
             elif opcode == OPCODE_RESIZEDB:
-                db_size, _ = self.read_length_encoded()
-                expire_size, _ = self.read_length_encoded()
-                print(f"DB size hint: {db_size}, expires: {expire_size}")
+                _, _ = self.read_length_encoded()
+                _, _ = self.read_length_encoded()
             elif opcode == OPCODE_EXPIRETIME_MS:
-                ts = int.from_bytes(self.read_bytes(8), 'little')
-                self.expiry_ms = ts
+                self.expiry_ms = int.from_bytes(self.read_bytes(8), 'little')
             elif opcode == OPCODE_EXPIRETIME_SEC:
-                ts = int.from_bytes(self.read_bytes(4), 'little')
-                self.expiry_ms = ts * 1000
+                self.expiry_ms = int.from_bytes(self.read_bytes(4), 'little') * 1000
             else:
-                # Data type (string)
                 value_type = opcode
                 key_bytes = self.read_string()
                 key = key_bytes.decode()
                 expiry_dt = None
+
                 if self.expiry_ms:
                     expiry_dt = datetime.datetime.fromtimestamp(self.expiry_ms / 1000.0)
                     self.expiry_ms = None
