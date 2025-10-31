@@ -63,11 +63,12 @@ def cmd_executor(decoded_data, connection, executing=False):
         return [], queued
 
     # --- MULTI ---
-    elif cmd == "MULTI":
-        transaction_queues[connection] = []
-        response = simple_string_encoder("OK")
-        connection.sendall(response)
-        return [], False
+
+    elif cmd == "MULTI":  # hi
+        queued = True
+        queue.append([])
+        connection.sendall(simple_string_encoder("OK"))
+        return [], queued
 
     # --- EXEC ---
     elif cmd == "EXEC":
