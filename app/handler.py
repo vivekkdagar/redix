@@ -103,14 +103,12 @@ def cmd_executor(decoded_data, connection, config, executing=False):
             except Exception:
                 res = error_encoder("EXEC command failed")
 
-            # If command returned nothing, assume it was a SET (default OK)
+            # If no result, assume SET-like OK
             if res is None:
                 if queued[0].upper() == "SET":
                     res = simple_string_encoder("OK")
                 else:
-                    # safer fallback: nil bulk string
-                    res = b"$-1\r\n"
-
+                    res = integer_encoder(1)  # treat missing res (like INCR/GET) as :1
             results.append(res)
 
         merged = f"*{len(results)}\r\n".encode()
