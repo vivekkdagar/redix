@@ -642,12 +642,13 @@ async def dispatch(argv, reader, writer):
                 multi_deques[writer_id(writer)].clear()
                 return resp_simple("OK")
             return resp_error("ERR DISCARD without MULTI")
-        if decoded_data[0].upper() == "EXEC":
+        elif decoded_data[0].upper() == "EXEC":
             if queued:
                 queued = False
                 print(f"EXEC queue: {queue}")
 
-                if not queue:
+                # If no queued commands, return empty array
+                if not queue or len(queue[0]) == 0:
                     connection.sendall(b"*0\r\n")
                     return [], queued
 
@@ -659,7 +660,7 @@ async def dispatch(argv, reader, writer):
                     try:
                         output, _ = cmd_executor(cmd, connection, config, queued, executing)
                         if output is None:
-                            # default for SET, etc.
+                            # Default responses for commands with no explicit return
                             if cmd[0].upper() == "SET":
                                 output = b"+OK\r\n"
                             else:
@@ -667,13 +668,11 @@ async def dispatch(argv, reader, writer):
                         elif isinstance(output, str):
                             output = output.encode()
                     except Exception as e:
-                        # Convert error to RESP error
-                        err_msg = f"-ERR {str(e)}\r\n".encode()
-                        output = err_msg
-
+                        # Instead of aborting, add error inside array
+                        output = f"-ERR {str(e)}\r\n".encode()
                     result.append(output)
 
-                # build RESP array response
+                # Build proper RESP array
                 merged = f"*{len(result)}\r\n".encode()
                 for r in result:
                     merged += r
@@ -681,8 +680,8 @@ async def dispatch(argv, reader, writer):
 
                 executing = False
                 return [], queued
-
             else:
+                # If EXEC called without MULTI
                 connection.sendall(b"-ERR EXEC without MULTI\r\n")
                 return [], queued
         if cmd_name == "subscribe":
