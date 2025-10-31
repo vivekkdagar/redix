@@ -43,9 +43,14 @@ def cmd_executor(decoded_data, connection, config, queued, executing):
     # --------------------------- BASIC COMMANDS ---------------------------
 
     # PING
+    # PING
     if decoded_data[0].upper() == "PING":
         BYTES_READ += len(resp_encoder(decoded_data))
-        response = simple_string_encoder("PONG")
+        if connection in subscriber_mode:
+            # Redis sends array form of PING when in SUBSCRIBE mode
+            response = resp_encoder(["pong", ""])
+        else:
+            response = simple_string_encoder("PONG")
         if executing:
             return response, queued
         connection.sendall(response)
