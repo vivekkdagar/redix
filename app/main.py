@@ -642,31 +642,49 @@ async def dispatch(argv, reader, writer):
                 multi_deques[writer_id(writer)].clear()
                 return resp_simple("OK")
             return resp_error("ERR DISCARD without MULTI")
-        if cmd_name == "exec":
-            if writer not in multi_clients:
-                return resp_error("ERR EXEC without MULTI")
-            # pop multi mode and get queued cmds
-            multi_clients.discard(writer)
-            queued = list(multi_deques[writer_id(writer)])
-            multi_deques[writer_id(writer)].clear()
-            if not queued:
-                return b"*0\r\n"
-            results = []
-            # Execute each queued command sequentially; each queued element is a list of bytes args
-            for q in queued:
-                # Note: while executing queued commands, we should not re-queue them — we already removed writer from multi_clients.
-                res = await dispatch(q, reader, writer)
-                # If handler returned None (blocked), then spec says EXEC should return error? For this simplified implementation, we'll put error.
-                if res is None:
-                    # return EXECABORT error element for that command
-                    results.append(resp_error("EXECABORT Transaction discarded because of previous errors."))
-                else:
-                    results.append(res)
-            # Build RESP array where each element is already a full RESP-encoded reply
-            merged = f"*{len(results)}\r\n".encode()
-            for r in results:
-                merged += r
-            return merged
+        elif decoded_data[0].upper() == "EXEC":
+            if queued:
+                queued = False
+                print(f"EXEC queue: {queue}")
+
+                if not queue:
+                    connection.sendall(b"*0\r\n")
+                    return [], queued
+
+                executing = True
+                result = []
+                q = queue.pop(0)
+
+                for cmd in q:
+                    try:
+                        output, _ = cmd_executor(cmd, connection, config, queued, executing)
+                        if output is None:
+                            # default for SET, etc.
+                            if cmd[0].upper() == "SET":
+                                output = b"+OK\r\n"
+                            else:
+                                output = b":1\r\n"
+                        elif isinstance(output, str):
+                            output = output.encode()
+                    except Exception as e:
+                        # Convert error to RESP error
+                        err_msg = f"-ERR {str(e)}\r\n".encode()
+                        output = err_msg
+
+                    result.append(output)
+
+                # build RESP array response
+                merged = f"*{len(result)}\r\n".encode()
+                for r in result:
+                    merged += r
+                connection.sendall(merged)
+
+                executing = False
+                return [], queued
+
+            else:
+                connection.sendall(b"-ERR EXEC without MULTI\r\n")
+                return [], queued
         if cmd_name == "subscribe":
             return await handle_subscribe(argv, reader, writer)
         if cmd_name == "unsubscribe":
