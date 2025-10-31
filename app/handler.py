@@ -23,7 +23,7 @@ def cmd_executor(connection, decoded_data, db, role, executing=False):
     """
     Execute a parsed Redis command and return a RESP-encoded response or 'custom' if manually handled.
     """
-    global db, sorted_set_dict, transaction_enabled, transactions
+    global sorted_set_dict, transaction_enabled, transactions
     response = "custom"
 
     if not value:
