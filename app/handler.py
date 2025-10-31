@@ -28,9 +28,11 @@ class Value:
         self.value = value
         self.expiry = expiry
 
-def cmd_executor(decoded_data, connection, executing=False):
-    global db, subscriber_mode, REPLICAOF_MODE, MASTER_REPL_ID, MASTER_REPL_OFFSET
+db = {}
 
+def cmd_executor(decoded_data, connection, config, executing=False):
+    global db, subscriber_mode, REPLICAOF_MODE, MASTER_REPL_ID, MASTER_REPL_OFFSET
+    db = config['store']
     if not decoded_data:
         return [], False
 
@@ -70,11 +72,13 @@ def cmd_executor(decoded_data, connection, executing=False):
 
     # --- MULTI ---
 
-    elif cmd == "MULTI":  # hi
-        queued = True
-        queue.append([])
+    elif cmd == "MULTI":
+
+        transaction_queues[connection] = []
+
         connection.sendall(simple_string_encoder("OK"))
-        return [], queued
+
+        return [], True
 
     # --- EXEC ---
     elif cmd == "EXEC":
@@ -307,7 +311,7 @@ def handle_client(connection, config, data=b""):
                     if decoded_data[0] == 82 or decoded_data[0] == 'F':
                         continue
 
-                    _, queued = cmd_executor(decoded_data, connection, executing)
+                    _, queued = cmd_executor(decoded_data, connection, config, executing)
 
                     prev_cmd = decoded_data[0]
 
