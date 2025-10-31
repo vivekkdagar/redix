@@ -179,24 +179,54 @@ def cmd_executor(decoded_data, connection, config, queued, executing):
         connection.sendall(simple_string_encoder("OK"))
         return [], queued
 
-    elif decoded_data[0].upper() == 'EXEC': #exec command
-        if queued:
-            queued = False
-            if not queue:
-                connection.sendall(resp_encoder([]))
-                return [], queued
-            executing = True
-            result = []
-            q = queue.pop(0)
-            for cmd in q:
-                output, queued = cmd_executor(cmd, connection, config, queued, executing)
-                result.append(output)
-            executing = False
-            connection.sendall(array_encoder(result))
-            return [], queued
-        else:
-            connection.sendall(error_encoder("ERR EXEC without MULTI"))
-            return [], queued
+
+    elif cmd == "EXEC":
+
+        if connection not in transaction_queues or not transaction_queues[connection]:
+            response = error_encoder("ERR EXEC without MULTI")
+
+            connection.sendall(response)
+
+            return [], False
+
+        # get queued commands
+
+        queued_cmds = transaction_queues.pop(connection, [])
+
+        if len(queued_cmds) == 0:
+            # empty queue -> return empty array
+
+            connection.sendall(b"*0\r\n")
+
+            return [], False
+
+        # send array length first
+
+        connection.sendall(f"*{len(queued_cmds)}\r\n".encode())
+
+        # execute queued commands one by one
+
+        for queued in queued_cmds:
+
+            res, _ = cmd_executor(queued, connection, executing=True)
+
+            if isinstance(res, bytes):
+
+                connection.sendall(res)
+
+            elif isinstance(res, str):
+
+                connection.sendall(res.encode())
+
+            elif isinstance(res, list):
+
+                connection.sendall(resp_encoder(res))
+
+            else:
+
+                connection.sendall(b"$-1\r\n")
+
+        return [], False
 
     elif decoded_data[0].upper() == 'DISCARD':
         if queued:
