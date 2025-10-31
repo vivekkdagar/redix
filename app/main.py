@@ -491,12 +491,16 @@ def cmd_executor(decoded, conn, config, executing=False):
     # UNSUBSCRIBE
     elif cmd == "UNSUBSCRIBE":
         ch = args[0] if args else None
-        if connection in subscriptions and ch in subscriptions[connection]:
-            subscriptions[connection].remove(ch)
-            if not subscriptions[connection]:
+        count = 0
+
+        if connection in subscriptions:
+            if ch in subscriptions[connection]:
+                subscriptions[connection].remove(ch)
+            count = len(subscriptions[connection])
+            if count == 0:
                 del subscriptions[connection]
-        count = len(subscriptions.get(connection, []))
-        # Manual encoding: integer for last field
+
+        # Always respond, even if channel wasn't subscribed
         resp = f"*3\r\n$11\r\nunsubscribe\r\n${len(ch)}\r\n{ch}\r\n:{count}\r\n".encode()
         connection.sendall(resp)
         return [], queued
