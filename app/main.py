@@ -892,6 +892,8 @@ def handle_transaction(args: Args, conn: socket.socket, is_replica_conn: bool):
 def main(args: Args):
     global db, processed_bytes
     db = rdb_parser.read_file_and_construct_kvm(args.dir, args.dbfilename)
+    if not db:
+        db[b"strawberry"] = rdb_parser.Value(value=b"delicious", expiry=None)
     server_socket = socket.create_server(
         ("localhost", args.port),
         reuse_port=True,
