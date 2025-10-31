@@ -21,6 +21,12 @@ channel_subs = {}      # {channel_name: set(connections)}
 subscriber_mode = set()  # track connections in SUBSCRIBE mode
 transaction_queues = {}  # global transaction state
 
+import datetime
+
+class Value:
+    def __init__(self, value, expiry=None):
+        self.value = value
+        self.expiry = expiry
 
 def cmd_executor(decoded_data, connection, executing=False):
     global db, subscriber_mode, REPLICAOF_MODE, MASTER_REPL_ID, MASTER_REPL_OFFSET
