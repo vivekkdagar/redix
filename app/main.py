@@ -482,6 +482,7 @@ def cmd_executor(decoded, conn, config, executing=False):
     # SUBSCRIBE
     # --- SUBSCRIBE ---
     # --- SUBSCRIBE ---
+    # --- SUBSCRIBE ---
     elif decoded_data[0].upper() == "SUBSCRIBE":
         channel_names = decoded_data[1:]
         if not channel_names:
