@@ -77,7 +77,7 @@ def cmd_executor(connection, decoded_data, db, role, executing=False):
             if db_value is None:
                 new_val = 1
             else:
-                try:
+                try: #hi
                     new_val = int(db_value.value.decode()) + 1
                 except Exception:
                     return "-ERR value is not an integer or out of range"
