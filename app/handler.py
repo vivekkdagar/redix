@@ -88,33 +88,35 @@ def cmd_executor(decoded_data, connection, config, executing=False):
     if cmd == "EXEC":
         if connection not in transaction_queues:
             connection.sendall(error_encoder("ERR EXEC without MULTI"))
-            return None, False
+            return [], False
 
         queued_cmds = transaction_queues.pop(connection, [])
+
         if not queued_cmds:
             connection.sendall(b"*0\r\n")
-            return None, False
+            return [], False
 
-        # Execute each queued command in "executing" mode (so they return encoded bytes)
-        results_encoded = []
-        for q in queued_cmds:
-            # q is a list like [b"SET", b"key", b"val"]
-            res, _ = cmd_executor(q, connection, config, executing=True)
-            # res should be bytes (RESP-encoded) when executing=True
-            if isinstance(res, bytes):
-                results_encoded.append(res)
-            elif isinstance(res, str):
-                results_encoded.append(resp_encoder(res))
-            elif isinstance(res, int):
-                results_encoded.append(resp_encoder(res))
+        results = []
+        for queued in queued_cmds:
+            res, _ = cmd_executor(queued, connection, config, executing=True)
+            if res is None:
+                res = simple_string_encoder("OK")
+            results.append(res)
+
+        # Merge full RESP array
+        merged = f"*{len(results)}\r\n".encode()
+        for r in results:
+            if isinstance(r, bytes):
+                merged += r
+            elif isinstance(r, str):
+                merged += r.encode()
+            elif isinstance(r, list):
+                merged += resp_encoder(r)
             else:
-                # null bulk / unknown
-                results_encoded.append(resp_encoder(None))
+                merged += simple_string_encoder("OK")
 
-        # Wrap all encoded results into a single RESP array and send once
-        merged = array_encoder(results_encoded)
         connection.sendall(merged)
-        return None, False
+        return [], False
 
     # DISCARD
     if cmd == "DISCARD":
