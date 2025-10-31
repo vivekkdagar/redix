@@ -179,7 +179,7 @@ def cmd_executor(decoded_data, connection, config, queued, executing):
         connection.sendall(simple_string_encoder("OK"))
         return [], queued
 
-    elif decoded_data[0].upper() == 'EXEC': #exec
+    elif decoded_data[0].upper() == 'EXEC': #exec command
         if queued:
             queued = False
             if not queue:
