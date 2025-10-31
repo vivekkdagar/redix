@@ -85,7 +85,7 @@ def cmd_executor(decoded_data, connection, config, executing=False):
         return None, True
 
     # EXEC
-    if cmd == "EXEC":
+    elif cmd == "EXEC":
         if connection not in transaction_queues:
             connection.sendall(error_encoder("ERR EXEC without MULTI"))
             return [], False
@@ -98,20 +98,22 @@ def cmd_executor(decoded_data, connection, config, executing=False):
 
         results = []
         for queued in queued_cmds:
-            res, _ = cmd_executor(queued, connection, config, executing=True)
-            if res is None:
+            try:
+                res, _ = cmd_executor(queued, connection, config, executing=True)
+            except Exception:
+                res = error_encoder("EXEC command failed")
+            # Substitute None with +OK (Redis does this for SET, etc.)
+            if res is None or res == b"$-1\r\n":
                 res = simple_string_encoder("OK")
             results.append(res)
 
-        # Merge full RESP array
+        # Build one full RESP array response
         merged = f"*{len(results)}\r\n".encode()
         for r in results:
             if isinstance(r, bytes):
                 merged += r
             elif isinstance(r, str):
                 merged += r.encode()
-            elif isinstance(r, list):
-                merged += resp_encoder(r)
             else:
                 merged += simple_string_encoder("OK")
 
