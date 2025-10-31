@@ -480,29 +480,55 @@ def cmd_executor(decoded, conn, config, executing=False):
             return resp_encoder(res)
     # SUBSCRIBE
     # SUBSCRIBE
-    if cmd == "SUBSCRIBE":
-        ch = args[1]
-        subscriptions.setdefault(conn, set()).add(ch)
-        channel_subs[ch].add(conn)
-        # Encode manually so last element is integer
-        count = len(subscriptions[conn])
-        resp = f"*3\r\n$9\r\nsubscribe\r\n${len(ch)}\r\n{ch}\r\n:{count}\r\n".encode()
-        return resp
-    # UNSUBSCRIBE
-    elif cmd == "UNSUBSCRIBE":
-        ch = args[0] if args else None
-        count = 0
+    # --- SUBSCRIBE ---
+    elif cmd == "SUBSCRIBE":
+        SUBSCRIBE = 1
+        if connection not in subscriptions:
+            subscriptions[connection] = set()
 
-        if connection in subscriptions:
+        responses = []
+        for ch in args:
+            subscriptions[connection].add(ch)
+            resp = (
+                f"*3\r\n$9\r\nsubscribe\r\n"
+                f"${len(ch)}\r\n{ch}\r\n"
+                f":{len(subscriptions[connection])}\r\n"
+            ).encode()
+            responses.append(resp)
+
+        for r in responses:
+            connection.sendall(r)
+        return [], queued
+
+
+    # --- UNSUBSCRIBE ---
+    elif cmd == "UNSUBSCRIBE":
+        if connection not in subscriptions:
+            subscriptions[connection] = set()
+
+        responses = []
+        channels = args if args else list(subscriptions[connection])
+        if not channels:
+            channels = [""]  # unsubscribing from all but none exist
+
+        for ch in channels:
             if ch in subscriptions[connection]:
                 subscriptions[connection].remove(ch)
             count = len(subscriptions[connection])
-            if count == 0:
-                del subscriptions[connection]
+            resp = (
+                f"*3\r\n$11\r\nunsubscribe\r\n"
+                f"${len(ch)}\r\n{ch}\r\n"
+                f":{count}\r\n"
+            ).encode()
+            responses.append(resp)
 
-        # Always respond, even if channel wasn't subscribed
-        resp = f"*3\r\n$11\r\nunsubscribe\r\n${len(ch)}\r\n{ch}\r\n:{count}\r\n".encode()
-        connection.sendall(resp)
+        for r in responses:
+            connection.sendall(r)
+
+        if not subscriptions[connection]:
+            del subscriptions[connection]
+            SUBSCRIBE = 0
+
         return [], queued
     # PUBLISH
     if cmd == "PUBLISH":
