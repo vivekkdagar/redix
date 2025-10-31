@@ -642,7 +642,7 @@ async def dispatch(argv, reader, writer):
                 multi_deques[writer_id(writer)].clear()
                 return resp_simple("OK")
             return resp_error("ERR DISCARD without MULTI")
-        elif decoded_data[0].upper() == "EXEC":
+        if decoded_data[0].upper() == "EXEC":
             if queued:
                 queued = False
                 print(f"EXEC queue: {queue}")
