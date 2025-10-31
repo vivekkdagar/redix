@@ -3,8 +3,8 @@ import threading
 import sys
 # Note: For a real package, you would import with '.command_executor',
 # but for a flat directory, the import might need adjustment.
-from app.command_execution import handle_connection
-import app.command_execution as ce
+from .command_execution import handle_connection
+import .command_execution as ce
 
 PING_COMMAND_RESP = b"*1\r\n$4\r\nPING\r\n"
 REPLCONF_CAPA_PSYNC2 = b"*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n"
