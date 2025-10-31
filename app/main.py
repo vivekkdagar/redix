@@ -874,6 +874,14 @@ def handle_transaction(args: Args, conn: socket.socket, is_replica_conn: bool):
 
 def main(args: Args):
     global db, processed_bytes
+
+    # Debug logging
+    print(f"[MAIN] Starting server on port {args.port}")
+    print(f"[MAIN] RDB dir: {args.dir}, filename: {args.dbfilename}")
+
+    # Load RDB file
+    db = rdb_parser.read_file_and_construct_kvm(args.dir, args.dbfilename)
+    print(f"[MAIN] Database has {len(db)} keys")
     db = rdb_parser.read_file_and_construct_kvm(args.dir, args.dbfilename)
     server_socket = socket.create_server(
         ("localhost", args.port),
