@@ -19,7 +19,7 @@ RDB_hex = '524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d6
 subscriptions = {}     # {connection: set(channel_names)}
 channel_subs = {}      # {channel_name: set(connections)}
 subscriber_mode = set()  # track connections in SUBSCRIBE mode
-def cmd_executor(args: Args, value: List, conn: socket.socket, is_replica_conn: bool = False) -> bytes | str | None | List[Any]:
+def cmd_executor(args, value: List, conn: socket.socket, is_replica_conn: bool = False) -> bytes | str | None | List[Any]:
     """
     Execute a parsed Redis command and return a RESP-encoded response or 'custom' if manually handled.
     """
