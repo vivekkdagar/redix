@@ -489,19 +489,17 @@ def cmd_executor(decoded, conn, config, executing=False):
         resp = f"*3\r\n$9\r\nsubscribe\r\n${len(ch)}\r\n{ch}\r\n:{count}\r\n".encode()
         return resp
     # UNSUBSCRIBE
-    if cmd == "UNSUBSCRIBE":
-        ch = args[1] if len(args)>=2 else None
-        if conn in subscriptions:
-            if ch:
-                subscriptions[conn].discard(ch)
-                channel_subs[ch].discard(conn)
-            else:
-                # unsubscribe all
-                for c in list(subscriptions[conn]):
-                    channel_subs[c].discard(conn)
-                subscriptions[conn].clear()
-        count = len(subscriptions.get(conn, set()))
-        return resp_encoder(["unsubscribe", ch if ch else "", str(count)])
+    elif cmd == "UNSUBSCRIBE":
+        ch = args[0] if args else None
+        if connection in subscriptions and ch in subscriptions[connection]:
+            subscriptions[connection].remove(ch)
+            if not subscriptions[connection]:
+                del subscriptions[connection]
+        count = len(subscriptions.get(connection, []))
+        # Manual encoding: integer for last field
+        resp = f"*3\r\n$11\r\nunsubscribe\r\n${len(ch)}\r\n{ch}\r\n:{count}\r\n".encode()
+        connection.sendall(resp)
+        return [], queued
     # PUBLISH
     if cmd == "PUBLISH":
         ch = args[1]; msg = args[2]
