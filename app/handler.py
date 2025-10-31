@@ -34,64 +34,41 @@ db = {}
 
 db = {}
 
+transaction_queues = {}
+
 def cmd_executor(decoded_data, connection, config, executing=False):
-    global db, subscriber_mode, REPLICAOF_MODE, MASTER_REPL_ID, MASTER_REPL_OFFSET
+    global db
     db = config['store']
-
     if not decoded_data:
-        return None, False
+        return [], False
 
-    cmd = (
-        decoded_data[0].decode().upper()
-        if isinstance(decoded_data[0], (bytes, bytearray))
-        else decoded_data[0].upper()
-    )
+    cmd = decoded_data[0].upper()
     args = decoded_data[1:]
+    response = None
     queued = False
 
-    # transaction queuing: if client is in MULTI mode, queue commands except control commands
+    # --- Queueing inside MULTI ---
     if connection in transaction_queues and cmd not in ["MULTI", "EXEC", "DISCARD"]:
         transaction_queues[connection].append(decoded_data)
-        resp = simple_string_encoder("QUEUED")
+        response = simple_string_encoder("QUEUED")
         if executing:
-            return resp, True
-        connection.sendall(resp)
-        return None, True
+            return response, True
+        connection.sendall(response)
+        return [], True
 
-    # PING
-    if cmd == "PING":
-        resp = resp_encoder(["pong", ""]) if connection in subscriber_mode else simple_string_encoder("PONG")
-        if executing:
-            return resp, False
-        connection.sendall(resp)
-        return None, False
-
-    # ECHO
-    if cmd == "ECHO":
-        msg = args[0] if args else b""
-        resp = resp_encoder(msg)
-        if executing:
-            return resp, False
-        connection.sendall(resp)
-        return None, False
-
-    # MULTI
+    # --- MULTI ---
     if cmd == "MULTI":
         transaction_queues[connection] = []
-        resp = simple_string_encoder("OK")
-        if executing:
-            return resp, True
-        connection.sendall(resp)
-        return None, True
+        connection.sendall(simple_string_encoder("OK"))
+        return [], True
 
-    # EXEC
+    # --- EXEC ---
     elif cmd == "EXEC":
         if connection not in transaction_queues:
             connection.sendall(error_encoder("ERR EXEC without MULTI"))
             return [], False
 
-        queued_cmds = transaction_queues.pop(connection, [])
-
+        queued_cmds = transaction_queues.pop(connection)
         if not queued_cmds:
             connection.sendall(b"*0\r\n")
             return [], False
@@ -101,14 +78,24 @@ def cmd_executor(decoded_data, connection, config, executing=False):
             try:
                 res, _ = cmd_executor(queued, connection, config, executing=True)
             except Exception:
-                res = error_encoder("EXEC command failed")
+                res = error_encoder("EXECABORT Transaction discarded because of previous errors.")
 
-            # If no result, assume SET-like OK
             if res is None:
-                if queued[0].upper() == "SET":
+                qcmd = queued[0].upper()
+                if qcmd == "SET":
                     res = simple_string_encoder("OK")
+                elif qcmd in ("INCR", "DECR"):
+                    val = db.get(queued[1])
+                    num = int(val.value) if isinstance(val, Value) else 0
+                    res = integer_encoder(num)
+                elif qcmd == "GET":
+                    val = db.get(queued[1])
+                    if val is None or (val.expiry and datetime.datetime.now() >= val.expiry):
+                        res = bulk_string_encoder(None)
+                    else:
+                        res = bulk_string_encoder(val.value)
                 else:
-                    res = integer_encoder(1)  # treat missing res (like INCR/GET) as :1
+                    res = simple_string_encoder("OK")
             results.append(res)
 
         merged = f"*{len(results)}\r\n".encode()
@@ -123,20 +110,35 @@ def cmd_executor(decoded_data, connection, config, executing=False):
         connection.sendall(merged)
         return [], False
 
-    # DISCARD
-    if cmd == "DISCARD":
+    # --- DISCARD ---
+    elif cmd == "DISCARD":
         if connection in transaction_queues:
             del transaction_queues[connection]
-            resp = simple_string_encoder("OK")
+            response = simple_string_encoder("OK")
         else:
-            resp = error_encoder("ERR DISCARD without MULTI")
-        if executing:
-            return resp, False
-        connection.sendall(resp)
-        return None, False
+            response = error_encoder("ERR DISCARD without MULTI")
+        connection.sendall(response)
+        return [], False
 
-    # SET
-    if cmd == "SET":
+    # --- PING ---
+    elif cmd == "PING":
+        response = simple_string_encoder("PONG")
+        if executing:
+            return response, queued
+        connection.sendall(response)
+        return [], queued
+
+    # --- ECHO ---
+    elif cmd == "ECHO":
+        msg = args[0] if args else ""
+        response = bulk_string_encoder(msg)
+        if executing:
+            return response, queued
+        connection.sendall(response)
+        return [], queued
+
+    # --- SET ---
+    elif cmd == "SET":
         key, value = args[0], args[1]
         expiry = None
         if len(args) > 2:
@@ -145,148 +147,49 @@ def cmd_executor(decoded_data, connection, config, executing=False):
             elif args[2].upper() == "PX" and len(args) >= 4:
                 expiry = datetime.datetime.now() + datetime.timedelta(milliseconds=int(args[3]))
         db[key] = Value(value=value, expiry=expiry)
-        resp = simple_string_encoder("OK")
+        response = simple_string_encoder("OK")
         if executing:
-            return resp, False
-        connection.sendall(resp)
-        return None, False
+            return response, queued
+        connection.sendall(response)
+        return [], queued
 
-    # GET
-    if cmd == "GET":
+    # --- GET ---
+    elif cmd == "GET":
         key = args[0]
-        val_obj = db.get(key)
-        if val_obj is None or (val_obj.expiry and datetime.datetime.now() >= val_obj.expiry):
-            resp = resp_encoder(None)
+        value = db.get(key)
+        if value is None or (value.expiry and datetime.datetime.now() >= value.expiry):
+            response = bulk_string_encoder(None)
         else:
-            resp = resp_encoder(val_obj.value)
+            response = bulk_string_encoder(value.value)
         if executing:
-            return resp, False
-        connection.sendall(resp)
-        return None, False
+            return response, queued
+        connection.sendall(response)
+        return [], queued
 
-    # INCR
-    if cmd == "INCR":
+    # --- INCR ---
+    elif cmd == "INCR":
         key = args[0]
         entry = db.get(key)
         if entry is None:
-            db[key] = Value(value=b"1")
-            resp = resp_encoder(1)
+            db[key] = Value(value="1")
+            response = integer_encoder(1)
         else:
             try:
-                new_val = int(entry.value.decode()) + 1
-                db[key] = Value(value=str(new_val).encode())
-                resp = resp_encoder(new_val)
-            except Exception:
-                resp = error_encoder("ERR value is not an integer or out of range")
+                new_val = int(entry.value) + 1
+                db[key] = Value(value=str(new_val))
+                response = integer_encoder(new_val)
+            except ValueError:
+                response = error_encoder("ERR value is not an integer or out of range")
         if executing:
-            return resp, False
-        connection.sendall(resp)
-        return None, False
+            return response, queued
+        connection.sendall(response)
+        return [], queued
 
-    # RPUSH
-    if cmd == "RPUSH":
-        key = args[0]
-        values = args[1:]
-        if key not in db or not isinstance(db[key].value, list):
-            db[key] = Value(value=[])
-        db[key].value.extend(values)
-        resp = resp_encoder(len(db[key].value))
-        if executing:
-            return resp, False
-        connection.sendall(resp)
-        return None, False
-
-    # LRANGE
-    if cmd == "LRANGE":
-        key = args[0]
-        start, stop = int(args[1]), int(args[2])
-        if key not in db or not isinstance(db[key].value, list):
-            resp = resp_encoder([])
-        else:
-            resp = resp_encoder(db[key].value[start:stop + 1])
-        if executing:
-            return resp, False
-        connection.sendall(resp)
-        return None, False
-
-    # EXPIRE
-    if cmd == "EXPIRE":
-        key = args[0]
-        ttl = int(args[1])
-        if key in db:
-            db[key].expiry = datetime.datetime.now() + datetime.timedelta(seconds=ttl)
-            resp = resp_encoder(1)
-        else:
-            resp = resp_encoder(0)
-        if executing:
-            return resp, False
-        connection.sendall(resp)
-        return None, False
-
-    # KEYS
-    if cmd == "KEYS":
-        pattern = args[0]
-        if pattern == "*":
-            ks = list(db.keys())
-        else:
-            import re
-            ks = [k for k in db.keys() if re.match(pattern.replace("*", ".*"), k)]
-        resp = resp_encoder(ks)
-        if executing:
-            return resp, False
-        connection.sendall(resp)
-        return None, False
-
-    # CONFIG GET
-    if cmd == "CONFIG" and len(args) >= 2 and args[0].upper() == "GET":
-        param = args[1]
-        if param == "dir":
-            resp = resp_encoder(["dir", "/tmp"])
-        elif param == "dbfilename":
-            resp = resp_encoder(["dbfilename", "dump.rdb"])
-        else:
-            resp = resp_encoder([])
-        if executing:
-            return resp, False
-        connection.sendall(resp)
-        return None, False
-
-    # INFO replication
-    if cmd == "INFO":
-        section = args[0].lower() if args else "all"
-        if section == "replication":
-            role = "master" if not globals().get("REPLICAOF_MODE") else "slave"
-            info_str = f"role:{role}\nmaster_replid:{globals().get('MASTER_REPL_ID','')}\nmaster_repl_offset:{globals().get('MASTER_REPL_OFFSET',0)}"
-            resp = resp_encoder(info_str.encode() if isinstance(info_str, str) else info_str)
-        else:
-            resp = resp_encoder("ok")
-        if executing:
-            return resp, False
-        connection.sendall(resp)
-        return None, False
-
-    # REPLCONF
-    if cmd == "REPLCONF":
-        resp = simple_string_encoder("OK")
-        if executing:
-            return resp, False
-        connection.sendall(resp)
-        return None, False
-
-    # PSYNC
-    if cmd == "PSYNC":
-        resp = simple_string_encoder(f"FULLRESYNC {globals().get('MASTER_REPL_ID','')} {globals().get('MASTER_REPL_OFFSET',0)}")
-        if executing:
-            return resp, False
-        connection.sendall(resp)
-        return None, False
-
-    # Unknown
-    resp = error_encoder(f"ERR unknown command '{cmd}'")
-    if executing:
-        return resp, False
-    connection.sendall(resp)
-    return None, False
+    # --- Default ---
+    else:
+        response = error_encoder(f"ERR unknown command '{cmd}'")
+        connection.sendall(response)
+        return [], queued
 
 
 def handle_client(connection, config, data=b""):
