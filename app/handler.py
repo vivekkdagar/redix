@@ -19,35 +19,32 @@ RDB_hex = '524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d6
 subscriptions = {}     # {connection: set(channel_names)}
 channel_subs = {}      # {channel_name: set(connections)}
 subscriber_mode = set()  # track connections in SUBSCRIBE mode
-def cmd_executor(decoded_data, connection, config, queued, executing):
-    global BYTES_READ, replica_acks, prev_cmd, SUBSCRIBE
-    global subscriptions, channel_subs, subscriber_mode, REPLICAS
+transaction_queues = {}  # global transaction state
 
-    print(f"decoded_data: {decoded_data}")
 
-    # --------------------------- SUBSCRIBER MODE GUARD ---------------------------
-    if connection in subscriber_mode:
-        allowed = ["SUBSCRIBE", "UNSUBSCRIBE", "PUBLISH", "PSUBSCRIBE", "PUNSUBSCRIBE", "PING", "QUIT"]
-        if decoded_data[0].upper() not in allowed:
-            response = error_encoder(f"ERR Can't execute '{decoded_data[0]}' in subscriber mode")
-            connection.sendall(response)
-            return [], queued
+def cmd_executor(decoded_data, connection, executing=False):
+    global db, subscriber_mode, REPLICAOF_MODE, MASTER_REPL_ID, MASTER_REPL_OFFSET
 
-    # --------------------------- EXEC TRANSACTION QUEUE ---------------------------
-    if queued and decoded_data[0].upper() not in ["EXEC", "DISCARD"]:
-        queue[len(queue) - 1].append(decoded_data)
+    if not decoded_data:
+        return [], False
+
+    cmd = decoded_data[0].upper()
+    args = decoded_data[1:]
+    response = None
+    queued = False
+
+    # --- Transaction queuing logic ---
+    if connection in transaction_queues and cmd not in ["MULTI", "EXEC", "DISCARD"]:
+        transaction_queues[connection].append(decoded_data)
         response = simple_string_encoder("QUEUED")
+        if executing:
+            return response, True
         connection.sendall(response)
-        return [], queued
+        return [], True
 
-    # --------------------------- BASIC COMMANDS ---------------------------
-
-    # PING
-    # PING
-    if decoded_data[0].upper() == "PING":
-        BYTES_READ += len(resp_encoder(decoded_data))
+    # --- PING ---
+    if cmd == "PING":
         if connection in subscriber_mode:
-            # Redis sends array form of PING when in SUBSCRIBE mode
             response = resp_encoder(["pong", ""])
         else:
             response = simple_string_encoder("PONG")
@@ -56,147 +53,38 @@ def cmd_executor(decoded_data, connection, config, queued, executing):
         connection.sendall(response)
         return [], queued
 
-    # ECHO
-    elif decoded_data[0].upper() == "ECHO" and len(decoded_data) > 1:
-        response = resp_encoder(decoded_data[1])
+    # --- ECHO ---
+    elif cmd == "ECHO":
+        msg = args[0] if args else ""
+        response = bulk_string_encoder(msg)
         if executing:
             return response, queued
         connection.sendall(response)
         return [], queued
 
-    # GET
-    elif decoded_data[0].upper() == "GET":
-        response = resp_encoder(getter(decoded_data[1]))
-        if executing:
-            return response, queued
-        connection.sendall(response)
-        return [], queued
-
-    # SET
-    elif decoded_data[0].upper() == "SET" and len(decoded_data) > 2:
-        BYTES_READ += len(resp_encoder(decoded_data))
-        if config['role'] == 'master':
-            for replica in REPLICAS:
-                replica.sendall(resp_encoder(decoded_data))
-        setter(decoded_data[1:])
+    # --- MULTI ---
+    elif cmd == "MULTI":
+        transaction_queues[connection] = []
         response = simple_string_encoder("OK")
-        if executing:
-            return response, queued
         connection.sendall(response)
-        return [], queued
+        return [], False
 
-    # --------------------------- LIST COMMANDS ---------------------------
-
-    elif decoded_data[0].upper() == "RPUSH" and len(decoded_data) > 2:
-        size = rpush(decoded_data[1:], blocked)
-        response = resp_encoder(size)
-        connection.sendall(response)
-        return [], queued
-
-    elif decoded_data[0].upper() == "LRANGE" and len(decoded_data) > 3:
-        response = resp_encoder(lrange(decoded_data[1:]))
-        connection.sendall(response)
-        return [], queued
-
-    elif decoded_data[0].upper() == "LPUSH":
-        size = lpush(decoded_data[1:])
-        response = resp_encoder(size)
-        connection.sendall(response)
-        return [], queued
-
-    elif decoded_data[0].upper() == "LLEN" and len(decoded_data) > 1:
-        size = llen(decoded_data[1])
-        response = resp_encoder(size)
-        connection.sendall(response)
-        return [], queued
-
-    elif decoded_data[0].upper() == "LPOP" and len(decoded_data) > 1:
-        response = resp_encoder(lpop(decoded_data[1:]))
-        connection.sendall(response)
-        return [], queued
-
-    elif decoded_data[0].upper() == "BLPOP" and len(decoded_data) > 2:
-        response = blpop(decoded_data[1:], connection, blocked)
-        if response is None:
-            return [], queued
-        else:
-            response = resp_encoder(response)
-            connection.sendall(response)
-        return [], queued
-
-    # --------------------------- STREAM COMMANDS ---------------------------
-
-    elif decoded_data[0].upper() == "TYPE" and len(decoded_data) > 1:
-        response = type_getter_lists(decoded_data[1])
-        if response == "none":
-            response2 = simple_string_encoder(type_getter_streams(decoded_data[1]))
-            connection.sendall(response2)
-        else:
-            response = simple_string_encoder(response)
-            connection.sendall(response)
-        return [], queued
-
-    elif decoded_data[0].upper() == "XADD" and len(decoded_data) > 4:
-        result = xadd(decoded_data[1:], blocked_xread)
-        if result[0] == "id":
-            response = resp_encoder(result[1])
-        else:
-            response = error_encoder(result[1])
-        connection.sendall(response)
-        return [], queued
-
-    elif decoded_data[0].upper() == "XRANGE" and len(decoded_data) >= 4:
-        result = xrange(decoded_data[1:])
-        response = resp_encoder(result)
-        connection.sendall(response)
-        return [], queued
-
-    elif decoded_data[0].upper() == "XREAD" and len(decoded_data) >= 4:
-        if decoded_data[1].upper() == "BLOCK":
-            result = blocks_xread(decoded_data[2:], connection, blocked_xread)
-            if result is None:
-                return [], queued
-        else:
-            result = xread(decoded_data[2:])
-            response = resp_encoder(result)
-            connection.sendall(response)
-        return [], queued
-
-    # --------------------------- TRANSACTION COMMANDS ---------------------------
-
-    elif decoded_data[0].upper() == "INCR" and len(decoded_data) > 1:
-        response = increment(decoded_data[1])
-        if response == -1:
-            response = error_encoder("ERR value is not an integer or out of range")
-        else:
-            response = resp_encoder(response)
-        connection.sendall(response)
-        return [], queued
-
-    elif decoded_data[0].upper() == 'MULTI': #hi
-        queued = True
-        queue.append([])
-        connection.sendall(simple_string_encoder("OK"))
-        return [], queued
-
-    elif decoded_data[0].upper() == 'EXEC': #exec command
+    # --- EXEC ---
+    elif cmd == "EXEC":
         if connection not in transaction_queues:
-            # EXEC called without MULTI
             connection.sendall(error_encoder("ERR EXEC without MULTI"))
             return [], False
 
         queued_cmds = transaction_queues.pop(connection, [])
 
         if not queued_cmds:
-            # empty transaction
             connection.sendall(b"*0\r\n")
             return [], False
 
-        # RESP array header for results
+        # Send RESP array header first
         connection.sendall(f"*{len(queued_cmds)}\r\n".encode())
 
         for queued in queued_cmds:
-            # Each queued command is a decoded_data list like ['SET', 'x', '1']
             res, _ = cmd_executor(queued, connection, executing=True)
             if isinstance(res, bytes):
                 connection.sendall(res)
@@ -209,124 +97,161 @@ def cmd_executor(decoded_data, connection, config, queued, executing):
 
         return [], False
 
-    elif decoded_data[0].upper() == 'DISCARD':
-        if queued:
-            queued = False
-            queue.clear()
-            connection.sendall(simple_string_encoder("OK"))
+    # --- DISCARD ---
+    elif cmd == "DISCARD":
+        if connection in transaction_queues:
+            del transaction_queues[connection]
+            response = simple_string_encoder("OK")
         else:
-            connection.sendall(error_encoder("ERR DISCARD without MULTI"))
-        return [], queued
-
-    # --------------------------- REPLICATION COMMANDS ---------------------------
-
-    elif decoded_data[0].upper() == "INFO":
-        response = "role:" + config['role']
-        if config['role'] == 'master':
-            response += f"\nmaster_replid:{config['master_replid']}\nmaster_repl_offset:{config['master_replid_offset']}"
-        connection.sendall(resp_encoder(response))
-        return [], queued
-
-    elif decoded_data[0].upper() == "REPLCONF":
-        if decoded_data[1].upper() == "GETACK" and config['role'] == 'slave':
-            response = resp_encoder(["REPLCONF", "ACK", str(BYTES_READ)])
-            BYTES_READ += len(resp_encoder(decoded_data))
-            connection.sendall(response)
-        elif decoded_data[1].upper() == "ACK" and config['role'] == 'master':
-            with threading.Lock():
-                replica_acks += 1
-        else:
-            connection.sendall(simple_string_encoder("OK"))
-        return [], queued
-
-    elif decoded_data[0].upper() == "PSYNC":
-        response = simple_string_encoder(f"FULLRESYNC {config['master_replid']} {config['master_replid_offset']}")
+            response = error_encoder("ERR DISCARD without MULTI")
         connection.sendall(response)
-        length = str(len(bytes.fromhex(RDB_hex))).encode('utf-8')
-        rdb_resp = b"$" + length + b"\r\n" + bytes.fromhex(RDB_hex)
-        connection.sendall(rdb_resp)
-        REPLICAS.append(connection)
-        return [], queued
+        return [], False
 
-    elif decoded_data[0].upper() == "WAIT":
-        if prev_cmd != "SET":
-            connection.sendall(resp_encoder(len(REPLICAS)))
-            return [], queued
-        else:
-            min_replicas = int(decoded_data[1])
-            timeout = int(decoded_data[2])
-            for replica_conn in REPLICAS:
-                replica_conn.send(resp_encoder(["REPLCONF", "GETACK", "*"]))
-            sleep(timeout / 1000)
-            with threading.Lock():
-                ack_count = replica_acks
-                replica_acks = 0
-            connection.sendall(resp_encoder(ack_count))
-            return [], queued
-
-    # --------------------------- CONFIG & KEYS ---------------------------
-
-    elif decoded_data[0].upper() == "CONFIG":
-        if decoded_data[2] == "dir":
-            response = resp_encoder(["dir", config['dir']])
-        elif decoded_data[2] == "dbfilename":
-            response = resp_encoder(["dbfilename", config['dbfilename']])
-        else:
-            response = error_encoder("ERR")
+    # --- SET ---
+    elif cmd == "SET":
+        key, value = args[0], args[1]
+        expiry = None
+        if len(args) > 2:
+            if args[2].upper() == "EX" and len(args) >= 4:
+                expiry = datetime.datetime.now() + datetime.timedelta(seconds=int(args[3]))
+            elif args[2].upper() == "PX" and len(args) >= 4:
+                expiry = datetime.datetime.now() + datetime.timedelta(milliseconds=int(args[3]))
+        db[key] = Value(value=value, expiry=expiry)
+        response = simple_string_encoder("OK")
+        if executing:
+            return response, queued
         connection.sendall(response)
         return [], queued
 
-    elif decoded_data[0].upper() == "KEYS":
-        connection.sendall(resp_encoder(keys()))
-        return [], queued
-
-    # --------------------------- PUB/SUB ---------------------------
-
-    elif decoded_data[0].upper() == "SUBSCRIBE":
-        SUBSCRIBE = 1
-        channels = decoded_data[1:]
-        if connection not in subscriptions:
-            subscriptions[connection] = set()
-        subscriber_mode.add(connection)
-        for channel in channels:
-            if channel not in channel_subs:
-                channel_subs[channel] = set()
-            if connection not in channel_subs[channel]:
-                channel_subs[channel].add(connection)
-                subscriptions[connection].add(channel)
-            resp = resp_encoder(["subscribe", channel, len(subscriptions[connection])])
-            connection.sendall(resp)
-        return [], queued
-
-    elif decoded_data[0].upper() == "UNSUBSCRIBE":
-        channels = decoded_data[1:] or list(subscriptions.get(connection, []))
-        for channel in channels:
-            if connection in channel_subs.get(channel, set()):
-                channel_subs[channel].remove(connection)
-            if connection in subscriptions:
-                subscriptions[connection].discard(channel)
-            resp = resp_encoder(["unsubscribe", channel, len(subscriptions.get(connection, []))])
-            connection.sendall(resp)
-        if not subscriptions.get(connection):
-            subscriber_mode.discard(connection)
-        return [], queued
-
-        # PUBLISH
-    elif decoded_data[0].upper() == "PUBLISH":
-        channel_name = decoded_data[1]
-        message = decoded_data[2]
-        tot_subscribers = 0
-        for conn in subscriptions:
-            if channel_name in subscriptions[conn]:
-                tot_subscribers += 1
-                conn.sendall(resp_encoder(["message", channel_name, message]))
-        response = resp_encoder(tot_subscribers)
+    # --- GET ---
+    elif cmd == "GET":
+        key = args[0]
+        value = db.get(key)
+        if value is None or (value.expiry and datetime.datetime.now() >= value.expiry):
+            response = bulk_string_encoder(None)
+        else:
+            response = bulk_string_encoder(value.value)
+        if executing:
+            return response, queued
         connection.sendall(response)
         return [], queued
 
-    # --------------------------- UNKNOWN ---------------------------
+    # --- INCR ---
+    elif cmd == "INCR":
+        key = args[0]
+        entry = db.get(key)
+        if entry is None:
+            db[key] = Value(value="1")
+            response = integer_encoder(1)
+        else:
+            try:
+                new_val = int(entry.value) + 1
+                db[key] = Value(value=str(new_val))
+                response = integer_encoder(new_val)
+            except ValueError:
+                response = error_encoder("ERR value is not an integer or out of range")
+        if executing:
+            return response, queued
+        connection.sendall(response)
+        return [], queued
+
+    # --- RPUSH ---
+    elif cmd == "RPUSH":
+        key = args[0]
+        values = args[1:]
+        if key not in db or not isinstance(db[key].value, list):
+            db[key] = Value(value=[])
+        db[key].value.extend(values)
+        response = integer_encoder(len(db[key].value))
+        if executing:
+            return response, queued
+        connection.sendall(response)
+        return [], queued
+
+    # --- LRANGE ---
+    elif cmd == "LRANGE":
+        key = args[0]
+        start, stop = int(args[1]), int(args[2])
+        if key not in db or not isinstance(db[key].value, list):
+            response = resp_encoder([])
+        else:
+            response = resp_encoder(db[key].value[start:stop + 1])
+        if executing:
+            return response, queued
+        connection.sendall(response)
+        return [], queued
+
+    # --- EXPIRE ---
+    elif cmd == "EXPIRE":
+        key = args[0]
+        ttl = int(args[1])
+        if key in db:
+            db[key].expiry = datetime.datetime.now() + datetime.timedelta(seconds=ttl)
+            response = integer_encoder(1)
+        else:
+            response = integer_encoder(0)
+        if executing:
+            return response, queued
+        connection.sendall(response)
+        return [], queued
+
+    # --- KEYS ---
+    elif cmd == "KEYS":
+        pattern = args[0]
+        if pattern == "*":
+            keys = list(db.keys())
+        else:
+            keys = [k for k in db.keys() if re.match(pattern.replace("*", ".*"), k)]
+        response = resp_encoder(keys)
+        if executing:
+            return response, queued
+        connection.sendall(response)
+        return [], queued
+
+    # --- CONFIG GET ---
+    elif cmd == "CONFIG" and len(args) >= 2 and args[0].upper() == "GET":
+        param = args[1]
+        if param == "dir":
+            response = resp_encoder(["dir", "/tmp"])
+        elif param == "dbfilename":
+            response = resp_encoder(["dbfilename", "dump.rdb"])
+        else:
+            response = resp_encoder([])
+        if executing:
+            return response, queued
+        connection.sendall(response)
+        return [], queued
+
+    # --- INFO replication ---
+    elif cmd == "INFO":
+        section = args[0].lower() if args else "all"
+        if section == "replication":
+            role = "master" if not REPLICAOF_MODE else "slave"
+            info_str = f"role:{role}\nmaster_replid:{MASTER_REPL_ID}\nmaster_repl_offset:{MASTER_REPL_OFFSET}"
+            response = bulk_string_encoder(info_str)
+        else:
+            response = bulk_string_encoder("ok")
+        if executing:
+            return response, queued
+        connection.sendall(response)
+        return [], queued
+
+    # --- REPLCONF ---
+    elif cmd == "REPLCONF":
+        response = simple_string_encoder("OK")
+        connection.sendall(response)
+        return [], queued
+
+    # --- PSYNC ---
+    elif cmd == "PSYNC":
+        response = simple_string_encoder(f"+FULLRESYNC {MASTER_REPL_ID} {MASTER_REPL_OFFSET}")
+        connection.sendall(response)
+        return [], queued
+
+    # --- UNKNOWN ---
     else:
-        connection.sendall(error_encoder("ERR unknown command"))
+        response = error_encoder(f"ERR unknown command '{cmd}'")
+        connection.sendall(response)
         return [], queued
 
 def handle_client(connection, config, data=b""):
