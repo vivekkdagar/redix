@@ -173,13 +173,13 @@ def cmd_executor(decoded_data, connection, config, queued, executing):
         connection.sendall(response)
         return [], queued
 
-    elif decoded_data[0].upper() == 'MULTI':
+    elif decoded_data[0].upper() == 'MULTI': #hi
         queued = True
         queue.append([])
         connection.sendall(simple_string_encoder("OK"))
         return [], queued
 
-    elif decoded_data[0].upper() == 'EXEC':
+    elif decoded_data[0].upper() == 'EXEC': #exec
         if queued:
             queued = False
             if not queue:
