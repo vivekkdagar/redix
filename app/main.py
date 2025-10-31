@@ -479,11 +479,15 @@ def cmd_executor(decoded, conn, config, executing=False):
             res = xread_fn(args[1:])
             return resp_encoder(res)
     # SUBSCRIBE
+    # SUBSCRIBE
     if cmd == "SUBSCRIBE":
         ch = args[1]
         subscriptions.setdefault(conn, set()).add(ch)
         channel_subs[ch].add(conn)
-        return resp_encoder(["subscribe", ch, str(len(subscriptions[conn]))])
+        # Encode manually so last element is integer
+        count = len(subscriptions[conn])
+        resp = f"*3\r\n$9\r\nsubscribe\r\n${len(ch)}\r\n{ch}\r\n:{count}\r\n".encode()
+        return resp
     # UNSUBSCRIBE
     if cmd == "UNSUBSCRIBE":
         ch = args[1] if len(args)>=2 else None
