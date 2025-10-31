@@ -179,51 +179,32 @@ def cmd_executor(decoded_data, connection, config, queued, executing):
         connection.sendall(simple_string_encoder("OK"))
         return [], queued
 
-
-    elif cmd == "EXEC":
-
-        if connection not in transaction_queues or not transaction_queues[connection]:
-            response = error_encoder("ERR EXEC without MULTI")
-
-            connection.sendall(response)
-
+    elif decoded_data[0].upper() == 'EXEC': #exec command
+        if connection not in transaction_queues:
+            # EXEC called without MULTI
+            connection.sendall(error_encoder("ERR EXEC without MULTI"))
             return [], False
-
-        # get queued commands
 
         queued_cmds = transaction_queues.pop(connection, [])
 
-        if len(queued_cmds) == 0:
-            # empty queue -> return empty array
-
+        if not queued_cmds:
+            # empty transaction
             connection.sendall(b"*0\r\n")
-
             return [], False
 
-        # send array length first
-
+        # RESP array header for results
         connection.sendall(f"*{len(queued_cmds)}\r\n".encode())
 
-        # execute queued commands one by one
-
         for queued in queued_cmds:
-
+            # Each queued command is a decoded_data list like ['SET', 'x', '1']
             res, _ = cmd_executor(queued, connection, executing=True)
-
             if isinstance(res, bytes):
-
                 connection.sendall(res)
-
             elif isinstance(res, str):
-
                 connection.sendall(res.encode())
-
             elif isinstance(res, list):
-
                 connection.sendall(resp_encoder(res))
-
             else:
-
                 connection.sendall(b"$-1\r\n")
 
         return [], False
