@@ -2,8 +2,8 @@ from typing import Any, Dict, Optional, List
 import datetime
 import dataclasses
 
-global_file_dir = "" # do we need this
-global_file_name =""
+global_file_dir = ""
+global_file_name = ""
 
 @dataclasses.dataclass
 class XADDValue:
@@ -16,7 +16,6 @@ class Value:
     value: Any | List[XADDValue]
     expiry: Optional[datetime.datetime]
 
-
 def read_file_and_construct_kvm(file_dir: str, file_name: str) -> Dict[Any, Value]:
     rdb_dict = {}
 
@@ -28,7 +27,6 @@ def read_file_and_construct_kvm(file_dir: str, file_name: str) -> Dict[Any, Valu
             buf = f.read()
             pos = 9  # Skip "REDIS0011" header
             while buf[pos] != 0xFE:
-                # print(buf[pos])
                 pos += 1
             pos += 5
 
@@ -45,20 +43,19 @@ def read_file_and_construct_kvm(file_dir: str, file_name: str) -> Dict[Any, Valu
                 key, pos = read_string(buf, pos)
                 val, pos = read_string(buf, pos)
 
-                entry =  Value(value=val.decode(), expiry=None)
+                # Keep value as bytes instead of decoding to string
+                entry = Value(value=val, expiry=None)
 
                 if expiry_type:
-                    # print(expiry_type)
-                    if expiry_type =="ms":
-                        expiry_value /= 1000 # type: ignore
-                    entry.expiry = expiry_value
+                    if expiry_type == "ms":
+                        expiry_value /= 1000  # type: ignore
+                    entry.expiry = datetime.datetime.fromtimestamp(expiry_value)  # type: ignore
 
                 rdb_dict[key.decode()] = entry
         return rdb_dict
     except Exception as e:
         print(e)
         return {}
-
 
 def read_length(buf, pos):
     """Read Redis-style length-encoded field starting at pos"""
