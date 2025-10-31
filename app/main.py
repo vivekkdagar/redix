@@ -292,29 +292,15 @@ def handle_command(
             response = s
         case [b"GET", k]:
             if not queue_transaction(value, conn):
-                key = k.decode()
                 now = datetime.datetime.now()
-
-                # Try getting from in-memory DB
-                db_value = db.get(k)
-
-                # Fallback: Try global storage from RDB parser
-                if db_value is None and key in storage.DATA_STORE:
-                    entry = storage.DATA_STORE[key]
-                    if entry.expiry is None or entry.expiry > time.time():
-                        val = entry.value
-                        response = val if isinstance(val, bytes) else str(val).encode()
-                    else:
-                        del storage.DATA_STORE[key]
-                        response = b""
-                elif db_value is None:
-                    response = b""
-                elif db_value.expiry is not None and now >= db_value.expiry:
-                    db.pop(k, None)
-                    response = b""
+                value = db.get(k)
+                if value is None:
+                    response = None
+                elif value.expiry is not None and now >= value.expiry:
+                    db.pop(k)
+                    response = None
                 else:
-                    val = db_value.value
-                    response = val if isinstance(val, bytes) else str(val).encode()
+                    response = value.value
         case [b"INFO", b"replication"]:
             if args.replicaof is None:
                 response = f"""\
@@ -389,7 +375,7 @@ master_repl_offset:{replication.master_repl_offset}
                 else:
                     response = "string"
             else:
-                response = "none"#type
+                response = "none"
 
         case [b'LLEN', k]:
             if k in db.keys():
@@ -880,25 +866,15 @@ def queue_transaction(command: List, conn: socket.socket):
 
 def handle_transaction(args: Args, conn: socket.socket, is_replica_conn: bool):
     global transactions
-    results = []
-    for command in transactions[conn]:
-        resp = handle_command(args, command, conn, is_replica_conn)
-        if resp is None:
-            # Return Null bulk for missing key or nil response
-            results.append(None)
-        elif isinstance(resp, (bytes, str, int, list)):
-            results.append(resp)
-        else:
-            # Fallback if something unexpected slips through
-            results.append(f"-ERR Invalid transaction response type {type(resp)}")
-    return results
+    response = []
+    for transaction in transactions[conn]:
+        response.append(handle_command(args, transaction, conn, is_replica_conn))
+    return response
 
 
 def main(args: Args):
     global db, processed_bytes
     db = rdb_parser.read_file_and_construct_kvm(args.dir, args.dbfilename)
-    if not db:
-        db[b"strawberry"] = rdb_parser.Value(value=b"delicious", expiry=None)
     server_socket = socket.create_server(
         ("localhost", args.port),
         reuse_port=True,

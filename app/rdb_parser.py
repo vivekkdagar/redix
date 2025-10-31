@@ -1,26 +1,9 @@
-# app/rdb_parser.py
-import io
-import time
-import datetime
-import traceback
-import dataclasses
 from typing import Any, Dict, Optional, List
+import datetime
+import dataclasses
 
-# --- GLOBALS ---
-global_file_dir = ""
-global_file_name = ""
-
-# --- Opcodes ---
-OPCODE_EXPIRETIME_MS = 0xfc
-OPCODE_EXPIRETIME_SEC = 0xfd
-OPCODE_SELECTDB = 0xfe
-OPCODE_EOF = 0xff
-OPCODE_RESIZEDB = 0xfb
-OPCODE_AUX = 0xfa
-
-# --- Value Types ---
-VALUE_TYPE_STRING = 0
-
+global_file_dir = "" # do we need this
+global_file_name =""
 
 @dataclasses.dataclass
 class XADDValue:
@@ -28,134 +11,101 @@ class XADDValue:
     milliseconds: Optional[int]
     sequence: Optional[int]
 
-
 @dataclasses.dataclass
 class Value:
     value: Any | List[XADDValue]
     expiry: Optional[datetime.datetime]
 
 
-class RdbParser:
-    def __init__(self, content: bytes):
-        self.file = io.BytesIO(content)
-        self.expiry_ms = None
+def read_file_and_construct_kvm(file_dir: str, file_name: str) -> Dict[Any, Value]:
+    rdb_dict = {}
 
-    def read_bytes(self, n):
-        data = self.file.read(n)
-        if len(data) < n:
-            raise EOFError("Unexpected EOF")
-        return data
-
-    def read_byte(self):
-        return self.read_bytes(1)[0]
-
-    def read_length_encoded(self):
-        first = self.read_byte()
-        enc_type = (first & 0b11000000) >> 6
-        if enc_type == 0:
-            return first & 0b00111111, False
-        elif enc_type == 1:
-            next_b = self.read_byte()
-            return ((first & 0b00111111) << 8) | next_b, False
-        elif enc_type == 2:
-            return int.from_bytes(self.read_bytes(4), 'big'), False
-        elif enc_type == 3:
-            subtype = first & 0b00111111
-            return subtype, True
-        else:
-            raise ValueError("Invalid length encoding")
-
-    def read_string(self):
-        length, is_special = self.read_length_encoded()
-        if is_special:
-            if length == 0:
-                val = int.from_bytes(self.read_bytes(1), 'little', signed=True)
-                return str(val).encode()
-            elif length == 1:
-                val = int.from_bytes(self.read_bytes(2), 'little', signed=True)
-                return str(val).encode()
-            elif length == 2:
-                val = int.from_bytes(self.read_bytes(4), 'little', signed=True)
-                return str(val).encode()
-            else:
-                raise ValueError(f"Unsupported special encoding {length}")
-        else:
-            return self.read_bytes(length)
-
-    def parse(self) -> Dict[str, Value]:
-        magic = self.read_bytes(5)
-        if magic != b"REDIS":
-            raise ValueError("Invalid RDB header")
-
-        version = self.read_bytes(4).decode()
-        print(f"RDB Version: {version}")
-        db: Dict[str, Value] = {}
-
-        while True:
-            opcode = self.read_byte()
-
-            if opcode == OPCODE_EOF:
-                print("Reached EOF marker.")
-                break
-            elif opcode == OPCODE_AUX:
-                _ = self.read_string()
-                _ = self.read_string()
-            elif opcode == OPCODE_SELECTDB:
-                _, _ = self.read_length_encoded()
-            elif opcode == OPCODE_RESIZEDB:
-                _, _ = self.read_length_encoded()
-                _, _ = self.read_length_encoded()
-            elif opcode == OPCODE_EXPIRETIME_MS:
-                self.expiry_ms = int.from_bytes(self.read_bytes(8), 'little')
-            elif opcode == OPCODE_EXPIRETIME_SEC:
-                self.expiry_ms = int.from_bytes(self.read_bytes(4), 'little') * 1000
-            else:
-                value_type = opcode
-                key_bytes = self.read_string()
-                key = key_bytes.decode()
-                expiry_dt = None
-
-                if self.expiry_ms:
-                    expiry_dt = datetime.datetime.fromtimestamp(self.expiry_ms / 1000.0)
-                    self.expiry_ms = None
-
-                if value_type == VALUE_TYPE_STRING:
-                    val_bytes = self.read_string()
-                    db[key] = Value(value=val_bytes, expiry=expiry_dt)
-                else:
-                    print(f"Skipping unsupported type {value_type}")
-                    continue
-        return db
-
-
-def read_file_and_construct_kvm(file_dir: str, file_name: str) -> Dict[str, Value]:
-    """Wrapper to load and return parsed RDB contents."""
     global global_file_dir, global_file_name
     global_file_dir = file_dir
     global_file_name = file_name
-
     try:
-        with open(f"{file_dir}/{file_name}", "rb") as f:
-            content = f.read()
-        if not content:
-            print("Empty RDB file")
-            return {}
-        parser = RdbParser(content)
-        data = parser.parse()
-        print(f"Parsed {len(data)} keys from RDB.")
-        return data
-    except FileNotFoundError:
-        print(f"RDB not found at {file_dir}/{file_name}")
-        return {}
+        with open(file_dir+"/"+file_name, "rb") as f:
+            buf = f.read()
+            pos = 9  # Skip "REDIS0011" header
+            while buf[pos] != 0xFE:
+                # print(buf[pos])
+                pos += 1
+            pos += 5
+
+            while buf[pos] != 0xFF:
+                # Check for expiry first
+                expiry_type, expiry_value, pos = read_expiry(buf, pos)
+
+                val_type = buf[pos]
+                pos += 1
+
+                if val_type != 0x00:
+                    raise NotImplementedError(f"Value type {val_type} not implemented")
+
+                key, pos = read_string(buf, pos)
+                val, pos = read_string(buf, pos)
+
+                entry =  Value(value=val.decode(), expiry=None)
+
+                if expiry_type:
+                    # print(expiry_type)
+                    if expiry_type =="ms":
+                        expiry_value /= 1000 # type: ignore
+                    entry.expiry = expiry_value
+
+                rdb_dict[key.decode()] = entry
+        return rdb_dict
     except Exception as e:
-        print(f"Error reading RDB: {e}")
-        traceback.print_exc()
+        print(e)
         return {}
 
+
+def read_length(buf, pos):
+    """Read Redis-style length-encoded field starting at pos"""
+    first_byte = buf[pos]
+    pos += 1
+    type_bits = (first_byte & 0xC0) >> 6
+
+    if type_bits == 0:
+        length = first_byte & 0x3F
+        return length, pos
+    elif type_bits == 1:
+        second_byte = buf[pos]
+        pos += 1
+        length = ((first_byte & 0x3F) << 8) | second_byte
+        return length, pos
+    elif type_bits == 2:
+        length = int.from_bytes(buf[pos:pos+4], "big")
+        pos += 4
+        return length, pos
+    elif type_bits == 3:
+        enc_type = first_byte & 0x3F
+        return ("special", enc_type), pos
+    else:
+        raise ValueError("Invalid length encoding")
+
+def read_string(buf, pos):
+    length, pos = read_length(buf, pos)
+    if isinstance(length, tuple) and length[0] == "special":
+        raise NotImplementedError(f"Special encoding {length[1]} not supported yet")
+    val = buf[pos:pos+length]
+    pos += length
+    return val, pos
+
+def read_expiry(buf, pos) -> tuple:
+    """Reads expiry time if present and returns (expiry_type, expiry_value, new_pos)"""
+    expiry_type = buf[pos]
+    if expiry_type == 0xFC:  # milliseconds
+        expiry_value = int.from_bytes(buf[pos+1:pos+9], "little")
+        return "ms", expiry_value, pos + 9
+    elif expiry_type == 0xFD:  # seconds
+        expiry_value = int.from_bytes(buf[pos+1:pos+5], "little")
+        return "s", expiry_value, pos + 5
+    else:
+        return None, None, pos  # No expiry
 
 def send_rdb_file() -> bytes:
-    """For replication (PSYNC): send the RDB file with length prefix."""
-    with open(f"{global_file_dir}/{global_file_name}", "rb") as f:
+    with open(global_file_dir+"/"+global_file_name, "rb") as f:
         buf = f.read()
-    header = f"${len(buf)}\r\n".encode()
-    return header + buf
+        header = f"${len(buf)}\r\n".encode()
+        return header + buf
