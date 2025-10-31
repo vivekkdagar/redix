@@ -41,7 +41,11 @@ def cmd_executor(decoded_data, connection, config, executing=False):
     if not decoded_data:
         return None, False
 
-    cmd = decoded_data[0].upper()
+    cmd = (
+        decoded_data[0].decode().upper()
+        if isinstance(decoded_data[0], (bytes, bytearray))
+        else decoded_data[0].upper()
+    )
     args = decoded_data[1:]
     queued = False
 
