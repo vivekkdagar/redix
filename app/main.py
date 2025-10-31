@@ -295,11 +295,10 @@ def handle_command(
                 now = datetime.datetime.now()
                 db_value = db.get(k)
 
-                if db_value is None:
-                    response = None
-                elif db_value.expiry is not None and now >= db_value.expiry:
+                if db_value is None or (db_value.expiry is not None and now >= db_value.expiry):
                     db.pop(k, None)
-                    response = None
+                    # Return empty bulk string instead of null
+                    response = b""
                 else:
                     val = db_value.value
                     # Normalize both bytes and str to UTF-8 decoded
@@ -307,7 +306,7 @@ def handle_command(
                         try:
                             response = val.decode()
                         except UnicodeDecodeError:
-                            response = val  # fallback raw bytes
+                            response = val
                     else:
                         response = str(val)
         case [b"INFO", b"replication"]:
