@@ -300,20 +300,16 @@ def cmd_executor(decoded_data, connection, config, queued, executing):
             subscriber_mode.discard(connection)
         return [], queued
 
-    elif decoded_data[0].upper() == "PUBLISH" and len(decoded_data) >= 3:
-        channel = decoded_data[1]
+        # PUBLISH
+    elif decoded_data[0].upper() == "PUBLISH":
+        channel_name = decoded_data[1]
         message = decoded_data[2]
-        if channel in channel_subs:
-            receivers = channel_subs[channel]
-            for conn in receivers:
-                try:
-                    msg_resp = resp_encoder(["message", channel, message])
-                    conn.sendall(msg_resp)
-                except:
-                    pass
-            response = resp_encoder(len(receivers))
-        else:
-            response = resp_encoder(0)
+        tot_subscribers = 0
+        for conn in subscriptions:
+            if channel_name in subscriptions[conn]:
+                tot_subscribers += 1
+                conn.sendall(resp_encoder(["message", channel_name, message]))
+        response = resp_encoder(tot_subscribers)
         connection.sendall(response)
         return [], queued
 
