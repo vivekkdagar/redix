@@ -216,18 +216,12 @@ def handle_client(connection, config, data=b""):
             for msg in messages:
                 try:
                     decoded_data = [
-                        x if isinstance(x, (bytes, bytearray)) else x
+                        x.decode() if isinstance(x, (bytes, bytearray)) else x
                         for x in msg
                     ]
+                    print(f"Parsed command: {decoded_data}")
 
-                    # call cmd_executor with config; let cmd_executor handle sending unless it returns bytes in executing mode
-                    res, queued = cmd_executor(decoded_data, connection, config, executing=False)
-
-                    prev_cmd = decoded_data[0]
-
-                    # If cmd_executor returned bytes when not already sent, send them.
-                    if res and isinstance(res, (bytes, bytearray)):
-                        connection.sendall(res)
+                    res, _ = cmd_executor(decoded_data, connection, config)
 
                 except Exception as e:
                     print(f"Error handling command {msg}: {e}")
