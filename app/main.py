@@ -1,21 +1,16 @@
 #!/usr/bin/env python3
 """
-Single-file Redis-like server implementing:
-- RESP parsing/encoding
-- SET/GET with expiry
-- Lists (RPUSH, LPUSH, LRANGE, LLEN, LPOP, BLPOP)
-- Streams (XADD, XRANGE, XREAD, blocking XREAD)
-- Transactions (MULTI, QUEUED, EXEC, DISCARD)
-- Pub/Sub (SUBSCRIBE, UNSUBSCRIBE, PUBLISH, subscribed mode, PING in subscribed mode)
-- INFO, CONFIG GET, KEYS stubs
-- Minimal RDB load stub
+redis_clone_allinone.py
+
+Single-file Redis-like server (asyncio) merging:
+- MULTI / EXEC from threaded Server logic
+- Pub/Sub with correct integer in subscribe/unsubscribe replies
+- Lists, Streams, Blocking, Transactions, RDB stub, INFO/CONFIG/KEYS
 """
+
 import asyncio
 import time
 import threading
-import struct
-import os
-import datetime
 from collections import defaultdict, deque
 
 BUF_SIZE = 65536
@@ -23,29 +18,25 @@ BUF_SIZE = 65536
 # ------------------------
 # In-memory stores
 # ------------------------
-# Key-value store: key -> [value, expiry_timestamp_float]
-kv = {}
-# Lists: key -> list
-lists = defaultdict(list)
-# Streams: key -> list of entries (entry is dict with 'id' and fields)
-streams = defaultdict(list)
-# XREAD blocking waiters: key -> list of (writer, start_id)
-xread_blocked = defaultdict(list)
-# BLPOP waiters: key -> deque of (writer)
-blpop_blocked = defaultdict(deque)
+kv = {}                        # key -> [value, expiry_ts_or_None]
+lists = defaultdict(list)      # key -> list
+streams = defaultdict(list)    # key -> list of entry dicts {'id':..., field: val, ...}
 
-# Transactions: per-writer queues
-multi_clients = set()               # set of writer identities currently in MULTI
-multi_deques = defaultdict(deque)   # key = writer_id (str) -> deque of queued commands
+# Blocking waiters
+blpop_blocked = defaultdict(deque)   # key -> deque of (writer)
+xread_blocked = defaultdict(list)    # key -> list of (writer, start_id)
 
-# Pub/sub
-subscriptions = {}      # writer -> set(channels)
-channel_subs = defaultdict(set)  # channel -> set(writers)
-subscriber_mode = set() # set of writers currently in subscribed mode
+# Transactions
+multi_clients = set()                # set of writer objects in MULTI mode
+multi_deques = defaultdict(deque)    # writer_id -> deque of queued commands (list-of-bytes argv)
 
-# Helper mapping writer -> id string
+# Pub/Sub
+subscriptions = {}                   # writer -> set(channels)
+channel_subs = defaultdict(set)      # channel -> set(writers)
+subscriber_mode = set()              # writers currently in subscribed mode
+
+# Helpers
 def writer_id(writer):
-    # Unique id per writer for dict keys
     return str(id(writer))
 
 # ------------------------
@@ -53,27 +44,22 @@ def writer_id(writer):
 # ------------------------
 
 def parse_next(data: bytes):
-    """
-    Parse one RESP item from the start of `data`.
-    Returns (item, remaining_bytes)
-    where item for an array is list of items; for bulk strings it returns bytes;
-    for simple strings it returns python str; for integer returns python int.
-    """
+    """Parse one RESP item from the start of data. Return (item, remaining)."""
     if not data:
-        raise RuntimeError("No data")
-    if data[0:1] == b'*':
-        # array
+        raise RuntimeError("Incomplete")
+    t = data[0:1]
+    if t == b'*':
         nl = data.find(b'\r\n')
         if nl == -1:
             raise RuntimeError("Incomplete")
-        arr_len = int(data[1:nl])
+        n = int(data[1:nl])
         rest = data[nl+2:]
-        items = []
-        for _ in range(arr_len):
+        arr = []
+        for _ in range(n):
             item, rest = parse_next(rest)
-            items.append(item)
-        return items, rest
-    elif data[0:1] == b'$':
+            arr.append(item)
+        return arr, rest
+    if t == b'$':
         nl = data.find(b'\r\n')
         if nl == -1:
             raise RuntimeError("Incomplete")
@@ -86,87 +72,70 @@ def parse_next(data: bytes):
         val = rest[:blen]
         rest = rest[blen+2:]
         return val, rest
-    elif data[0:1] == b'+':
+    if t == b'+':
         nl = data.find(b'\r\n')
         if nl == -1:
             raise RuntimeError("Incomplete")
         return data[1:nl].decode(), data[nl+2:]
-    elif data[0:1] == b'-':
+    if t == b'-':
         nl = data.find(b'\r\n')
         if nl == -1:
             raise RuntimeError("Incomplete")
         return Exception(data[1:nl].decode()), data[nl+2:]
-    elif data[0:1] == b':':
+    if t == b':':
         nl = data.find(b'\r\n')
         if nl == -1:
             raise RuntimeError("Incomplete")
         return int(data[1:nl]), data[nl+2:]
-    else:
-        raise RuntimeError("Unknown RESP type")
+    raise RuntimeError("Unknown RESP type")
 
-def parse_all(data: bytes):
-    """
-    Try to parse as many complete RESP messages as possible.
-    Returns a list of parsed messages (each is a list of bulk strings or similar)
-    """
-    messages = []
-    buf = data
+def parse_all(buffer: bytes):
+    """Parse as many complete RESP messages as possible and return list of items."""
+    msgs = []
+    buf = buffer
+    consumed = 0
     while buf:
         try:
             item, buf = parse_next(buf)
-            # flatten bulk-string bytes to bytes objects, arrays come as lists
-            if isinstance(item, list):
-                # convert bulk bytes inside to bytes or str as needed later
-                messages.append(item)
-            else:
-                messages.append(item)
+            msgs.append(item)
+            consumed = len(buffer) - len(buf)
         except RuntimeError:
             break
-    return messages
+    return msgs, consumed
 
-def resp_encode_simple_str(s: str):
+def resp_simple(s: str):
     return f"+{s}\r\n".encode()
 
-def resp_encode_error(s: str):
+def resp_error(s: str):
     return f"-{s}\r\n".encode()
 
-def resp_encode_int(n: int):
+def resp_int(n: int):
     return f":{n}\r\n".encode()
 
-def resp_encode_bulk(b: bytes | str | None):
+def resp_bulk(b):
     if b is None:
         return b"$-1\r\n"
     if isinstance(b, str):
         b = b.encode()
     return b"${}\r\n".format(len(b)).encode() + b + b"\r\n"
 
-def resp_encode_array_from_bytes_elements(byte_elements: list[bytes]):
-    out = f"*{len(byte_elements)}\r\n".encode()
-    for e in byte_elements:
+def resp_array_from_encoded(elements: list[bytes]):
+    out = f"*{len(elements)}\r\n".encode()
+    for e in elements:
         out += e
     return out
 
-def resp_array_items(items):
-    """build array where items are already RESP-encoded bytes"""
-    return resp_encode_array_from_bytes_elements(items)
-
-# Helper to create array [bulk_str, bulk_str, int] like subscribe/unsubscribe etc.
 def resp_subscribe_reply(kind: str, channel: str, count: int):
-    # ["subscribe"/"unsubscribe", channel, count]
-    # must be: *3\r\n$<len(kind)>\r\nkind\r\n$<len(channel)>\r\nchannel\r\n:<count>\r\n
-    return (f"*3\r\n${len(kind)}\r\n{kind}\r\n"
-            f"${len(channel)}\r\n{channel}\r\n"
-            f":{count}\r\n").encode()
+    # *3\r\n$<len(kind)>\r\nkind\r\n$<len(channel)>\r\nchannel\r\n:<count>\r\n
+    return (f"*3\r\n${len(kind)}\r\n{kind}\r\n${len(channel)}\r\n{channel}\r\n:{count}\r\n").encode()
 
 # ------------------------
-# Utility helpers
+# Utilities
 # ------------------------
-
-def now_ms():
-    return time.time() * 1000.0
+def now_s():
+    return time.time()
 
 def ensure_kv_cleanup(key):
-    """Remove expired key if expired"""
     v = kv.get(key)
     if not v:
         return
@@ -175,64 +144,62 @@ def ensure_kv_cleanup(key):
         del kv[key]
 
 # ------------------------
-# Command handlers (async)
-# Return RESP bytes or None if blocking/no immediate response
+# Command handlers (return RESP bytes or None if blocking)
 # ------------------------
 
-async def handle_ping(args, reader=None, writer=None):
-    # If in subscribed mode, PING returns array ["pong", msg] (bulk strings)
-    if writer and writer in subscriber_mode:
-        msg = args[0].decode() if args else ""
+async def handle_ping(argv, reader=None, writer=None):
+    # PING in subscribed mode should return array ["pong", msg] (bulk strings)
+    if writer in subscriber_mode:
+        msg = argv[1].decode() if len(argv) > 1 and argv[1] is not None else ""
         return (f"*2\r\n$4\r\npong\r\n${len(msg)}\r\n{msg}\r\n").encode()
-    return resp_encode_simple_str("PONG")
+    return resp_simple("PONG")
 
-async def handle_echo(args, reader=None, writer=None):
-    msg = args[0].decode() if args else ""
-    return resp_encode_bulk(msg)
+async def handle_echo(argv, reader=None, writer=None):
+    msg = argv[1].decode() if len(argv) > 1 and argv[1] is not None else ""
+    return resp_bulk(msg)
 
-async def handle_set(args, reader=None, writer=None):
-    # args are bytes
-    key = args[0].decode()
-    val = args[1].decode()
+async def handle_set(argv, reader=None, writer=None):
+    key = argv[1].decode()
+    val = argv[2].decode()
     expiry = None
-    if len(args) >= 4:
-        opt = args[2].decode().upper()
+    if len(argv) >= 5:
+        opt = argv[3].decode().upper()
         if opt == "PX":
-            expiry = time.time() + int(args[3].decode()) / 1000.0
+            expiry = time.time() + int(argv[4].decode())/1000.0
         elif opt == "EX":
-            expiry = time.time() + int(args[3].decode())
+            expiry = time.time() + int(argv[4].decode())
     kv[key] = [val, expiry]
-    return resp_encode_simple_str("OK")
+    return resp_simple("OK")
 
-async def handle_get(args, reader=None, writer=None):
-    key = args[0].decode()
+async def handle_get(argv, reader=None, writer=None):
+    key = argv[1].decode()
     ensure_kv_cleanup(key)
     v = kv.get(key)
     if not v:
-        return resp_encode_bulk(None)
-    return resp_encode_bulk(v[0])
+        return resp_bulk(None)
+    return resp_bulk(v[0])
 
-async def handle_incr(args, reader=None, writer=None):
-    key = args[0].decode()
+async def handle_incr(argv, reader=None, writer=None):
+    key = argv[1].decode()
     ensure_kv_cleanup(key)
     v = kv.get(key)
     if not v:
         kv[key] = ["1", None]
-        return resp_encode_int(1)
+        return resp_int(1)
     val, expiry = v
     try:
         n = int(val) + 1
     except Exception:
-        return resp_encode_error("ERR value is not an integer or out of range")
+        return resp_error("ERR value is not an integer or out of range")
     kv[key] = [str(n), expiry]
-    return resp_encode_int(n)
+    return resp_int(n)
 
 # --- Lists ---
-async def handle_rpush(args, reader=None, writer=None):
-    key = args[0].decode()
-    for b in args[1:]:
+async def handle_rpush(argv, reader=None, writer=None):
+    key = argv[1].decode()
+    for b in argv[2:]:
         lists[key].append(b.decode())
-    # wake any blocked BLPOP for this key
+    # wake blpop if any
     if key in blpop_blocked and blpop_blocked[key]:
         w = blpop_blocked[key].popleft()
         element = lists[key].pop(0)
@@ -242,22 +209,22 @@ async def handle_rpush(args, reader=None, writer=None):
             await w.drain()
         except Exception:
             pass
-    return resp_encode_int(len(lists[key]))
+    return resp_int(len(lists[key]))
 
-async def handle_lpush(args, reader=None, writer=None):
-    key = args[0].decode()
-    for b in args[1:]:
+async def handle_lpush(argv, reader=None, writer=None):
+    key = argv[1].decode()
+    for b in argv[2:]:
         lists[key].insert(0, b.decode())
-    return resp_encode_int(len(lists[key]))
+    return resp_int(len(lists[key]))
 
-async def handle_llen(args, reader=None, writer=None):
-    key = args[0].decode()
-    return resp_encode_int(len(lists.get(key, [])))
+async def handle_llen(argv, reader=None, writer=None):
+    key = argv[1].decode()
+    return resp_int(len(lists.get(key, [])))
 
-async def handle_lrange(args, reader=None, writer=None):
-    key = args[0].decode()
-    start = int(args[1].decode())
-    end = int(args[2].decode())
+async def handle_lrange(argv, reader=None, writer=None):
+    key = argv[1].decode()
+    start = int(argv[2].decode())
+    end = int(argv[3].decode())
     arr = lists.get(key, [])
     n = len(arr)
     if n == 0:
@@ -267,66 +234,68 @@ async def handle_lrange(args, reader=None, writer=None):
     if end < 0:
         end = n + end
     start = max(0, start)
-    end = min(n - 1, end)
+    end = min(n-1, end)
     if start > end:
         return b"*0\r\n"
-    subset = arr[start:end+1]
-    out = f"*{len(subset)}\r\n".encode()
-    for s in subset:
-        out += resp_encode_bulk(s)
+    sub = arr[start:end+1]
+    out = f"*{len(sub)}\r\n".encode()
+    for s in sub:
+        out += resp_bulk(s)
     return out
 
-async def handle_lpop(args, reader=None, writer=None):
-    key = args[0].decode()
+async def handle_lpop(argv, reader=None, writer=None):
+    key = argv[1].decode()
     if key not in lists or not lists[key]:
-        return resp_encode_bulk(None)
-    if len(args) == 1:
+        return resp_bulk(None)
+    if len(argv) == 2:
         v = lists[key].pop(0)
-        return resp_encode_bulk(v)
+        return resp_bulk(v)
     else:
-        count = int(args[1].decode())
+        count = int(argv[2].decode())
         popped = []
         for _ in range(min(count, len(lists[key]))):
             popped.append(lists[key].pop(0))
         out = f"*{len(popped)}\r\n".encode()
         for p in popped:
-            out += resp_encode_bulk(p)
+            out += resp_bulk(p)
         return out
 
-async def handle_blpop(args, reader=None, writer=None):
-    key = args[0].decode()
-    timeout = float(args[1].decode())
+async def handle_blpop(argv, reader=None, writer=None):
+    key = argv[1].decode()
+    timeout = float(argv[2].decode())
     if key in lists and lists[key]:
         v = lists[key].pop(0)
         return (f"*2\r\n${len(key)}\r\n{key}\r\n${len(v)}\r\n{v}\r\n").encode()
-    # else block
+    # block
     blpop_blocked[key].append(writer)
     async def timeout_unblock():
         if timeout == 0:
             return
         await asyncio.sleep(timeout)
-        # still blocked?
-        if writer in blpop_blocked.get(key, ()):
-            try:
-                blpop_blocked[key].remove(writer)
-            except ValueError:
-                return
-            try:
-                writer.write(b"*-1\r\n")
-                await writer.drain()
-            except Exception:
-                pass
+        # if still blocked:
+        try:
+            if writer in blpop_blocked.get(key, ()):
+                try:
+                    blpop_blocked[key].remove(writer)
+                except ValueError:
+                    return
+                try:
+                    writer.write(b"*-1\r\n")
+                    await writer.drain()
+                except Exception:
+                    pass
+        except Exception:
+            pass
     asyncio.create_task(timeout_unblock())
     return None
 
 # --- Streams (basic) ---
-def _allot_stream_id(key, ts=None):
-    # returns string id like "<ms>-<seq>"
-    t = int(time.time() * 1000) if ts is None else int(ts)
+def _allot_stream_id(key, tstamp=None):
+    t = int(time.time()*1000) if tstamp is None else int(tstamp)
     seq = 0
     if streams[key]:
         last = streams[key][-1]['id']
-        last_t, last_s = map(int, last.split('-', 1))
+        last_t, last_s = map(int, last.split('-',1))
         if t < last_t:
             t = last_t
             seq = last_s + 1
@@ -334,119 +303,91 @@ def _allot_stream_id(key, ts=None):
             seq = last_s + 1
     return f"{t}-{seq}"
 
-async def handle_xadd(args, reader=None, writer=None):
-    key = args[0].decode()
-    entry_id = args[1].decode()
+async def handle_xadd(argv, reader=None, writer=None):
+    key = argv[1].decode()
+    entry_id = argv[2].decode()
     if entry_id == '*':
         eid = _allot_stream_id(key)
     else:
         if '-' in entry_id:
-            tpart, spart = entry_id.split('-', 1)
+            tpart, spart = entry_id.split('-',1)
             if spart == '*':
-                eid = _allot_stream_id(key, ts=int(tpart))
+                eid = _allot_stream_id(key, tstamp=int(tpart))
             else:
                 eid = entry_id
         else:
             eid = _allot_stream_id(key)
-    # fields
     fields = {}
-    for i in range(2, len(args), 2):
-        fields[args[i].decode()] = args[i+1].decode()
+    for i in range(3, len(argv), 2):
+        fields[argv[i].decode()] = argv[i+1].decode()
     entry = {'id': eid}
     entry.update(fields)
     streams[key].append(entry)
-    # notify any xread blocked waiters
+    # notify xread blocked waiters
     if key in xread_blocked and xread_blocked[key]:
         pending = list(xread_blocked[key])
         xread_blocked[key].clear()
         for w, start_id in pending:
-            # collect entries > start_id
             out_entries = []
             for e in streams[key]:
                 if e['id'] > start_id:
-                    # build fields flat
-                    fields_list = []
+                    fv = []
                     for kf, vf in e.items():
                         if kf == 'id': continue
-                        fields_list.append([kf, vf])
-                    out_entries.append([e['id'], fields_list])
+                        fv.append([kf, vf])
+                    out_entries.append([e['id'], fv])
             if out_entries:
-                # Construct response array: *1 -> [ [ key, [ [id, [field, value ...]]... ] ] ]
-                # Build resp manually
                 s = f"*1\r\n*2\r\n${len(key)}\r\n{key}\r\n*{len(out_entries)}\r\n".encode()
                 for eid, fv in out_entries:
                     s += f"${len(eid)}\r\n{eid}\r\n".encode()
-                    # now fv is list of [field, value] pairs - as array of 2*N bulk strings
                     s += f"*{len(fv)*2}\r\n".encode()
-                    for pair in fv:
-                        s += resp_encode_bulk(pair[0])
-                        s += resp_encode_bulk(pair[1])
+                    for p in fv:
+                        s += resp_bulk(p[0])
+                        s += resp_bulk(p[1])
                 try:
                     w.write(s)
                     await w.drain()
                 except Exception:
                     pass
-    return resp_encode_bulk(eid)
+    return resp_bulk(eid)
 
-async def handle_xrange(args, reader=None, writer=None):
-    key = args[0].decode()
-    start = args[1].decode()
-    end = args[2].decode()
+async def handle_xrange(argv, reader=None, writer=None):
+    key = argv[1].decode()
+    start = argv[2].decode()
+    end = argv[3].decode()
     if key not in streams:
         return b"*0\r\n"
     out = []
     for e in streams[key]:
         if start <= e['id'] <= end:
-            # build [id, [field, value ...]]
-            fields = []
+            fv = []
             for kf, vf in e.items():
                 if kf == 'id': continue
-                fields.append([kf, vf])
-            out.append([e['id'], fields])
-    # Convert to RESP array: *N entries -> each entry is array [id, [fields...]]
+                fv.append([kf, vf])
+            out.append([e['id'], fv])
     if not out:
         return b"*0\r\n"
     s = f"*{len(out)}\r\n".encode()
-    for eid, fields in out:
+    for eid, fv in out:
         s += f"*2\r\n${len(eid)}\r\n{eid}\r\n".encode()
-        # fields array as array-of-arrays
-        s += f"*{len(fields)}\r\n".encode()
-        for fpair in fields:
-            # each field pair should be array [field, value]
+        s += f"*{len(fv)}\r\n".encode()
+        for p in fv:
+            # flatten each pair as array [field, val]
             s += f"*2\r\n".encode()
-            s += resp_encode_bulk(fpair[0])
-            s += resp_encode_bulk(fpair[1])
+            s += resp_bulk(p[0])
+            s += resp_bulk(p[1])
     return s
 
-async def handle_xread(args, reader=None, writer=None):
-    # Support BLOCK <ms> STREAMS <key> <id>
-    # or XREAD STREAMS k1 k2 ... id1 id2 ...
-    if args[0].decode().upper() == 'BLOCK':
-        timeout_ms = int(args[1].decode())
-        # next token should be 'STREAMS'
-        # then keys...
-        idx = 3
-        keys = []
-        while True:
-            if args[idx].decode().upper() == 'STREAMS':
-                idx += 1
-                break
-            keys.append(args[idx].decode())
-            idx += 1
-        # actually above logic not typical; tests will usually use BLOCK STREAMS key id
-        # Simplify: assume form: BLOCK <ms> STREAMS <key> <id>
-        # So keys = []
-        if len(args) >= 5 and args[2].decode().upper() == 'STREAMS':
-            key = args[3].decode()
-            start = args[4].decode()
-        else:
-            # fallback
-            return b"-ERR unsupported XREAD format\r\n"
-        if start == '$':
-            start_id = streams[key][-1]['id'] if streams[key] else '0-0'
-        else:
-            start_id = start
-        # check if entries exist now
+async def handle_xread(argv, reader=None, writer=None):
+    # only supporting BLOCK STREAMS key id and simple non-blocking variant
+    if argv[0].decode().upper() == 'BLOCK':
+        timeout_ms = int(argv[1].decode())
+        # expect: BLOCK <ms> STREAMS <key> <id>
+        if argv[2].decode().upper() != 'STREAMS':
+            return resp_error("ERR unsupported XREAD format")
+        key = argv[3].decode()
+        start = argv[4].decode()
+        start_id = streams[key][-1]['id'] if streams[key] and start == '$' else start
         found = []
         for e in streams[key]:
             if e['id'] > start_id:
@@ -456,47 +397,44 @@ async def handle_xread(args, reader=None, writer=None):
                     fv.append([kf, vf])
                 found.append([e['id'], fv])
         if found:
-            # build response similar to XADD notify earlier
             s = f"*1\r\n*2\r\n${len(key)}\r\n{key}\r\n*{len(found)}\r\n".encode()
             for eid, fv in found:
                 s += f"${len(eid)}\r\n{eid}\r\n".encode()
                 s += f"*{len(fv)*2}\r\n".encode()
                 for p in fv:
-                    s += resp_encode_bulk(p[0])
-                    s += resp_encode_bulk(p[1])
+                    s += resp_bulk(p[0])
+                    s += resp_bulk(p[1])
             return s
-        # else block
-        # store (writer, start_id)
-        xread_blocked[key].append((writer, start_id))
+        # block
+        xread_blocked[key].append((writer, start if start != '$' else ('0-0')))
         async def timeout_unblock():
             if timeout_ms == 0:
                 return
-            await asyncio.sleep(timeout_ms / 1000.0)
-            # if still blocked, send null array
+            await asyncio.sleep(timeout_ms/1000.0)
+            # if still blocked
             try:
-                rem = []
-                for w, sid in xread_blocked[key]:
+                pending = list(xread_blocked.get(key, []))
+                for w,sid in pending:
                     if w is writer:
-                        rem.append((w, sid))
-                for r in rem:
-                    try:
-                        writer.write(b"*-1\r\n")
-                        await writer.drain()
-                    except Exception:
-                        pass
-                    try:
-                        xread_blocked[key].remove(r)
-                    except ValueError:
-                        pass
+                        try:
+                            writer.write(b"*-1\r\n")
+                            await writer.drain()
+                        except Exception:
+                            pass
+                        try:
+                            xread_blocked[key].remove((w,sid))
+                        except ValueError:
+                            pass
+                        break
             except Exception:
                 pass
         asyncio.create_task(timeout_unblock())
         return None
     else:
-        # non-blocking XREAD
-        half = len(args)//2
-        keys = [a.decode() for a in args[:half]]
-        ids = [a.decode() for a in args[half:]]
+        # non-blocking XREAD STREAMS k1 k2 ... id1 id2 ...
+        half = len(argv)//2
+        keys = [a.decode() for a in argv[:half]]
+        ids = [a.decode() for a in argv[half:]]
         result = []
         for key, start in zip(keys, ids):
             entries = []
@@ -508,11 +446,9 @@ async def handle_xread(args, reader=None, writer=None):
                         fv.append([kf, vf])
                     entries.append([e['id'], fv])
             if entries:
-                # append [key, entries]
                 result.append([key, entries])
         if not result:
             return b"*0\r\n"
-        # build RESP
         s = f"*{len(result)}\r\n".encode()
         for key, entries in result:
             s += f"*2\r\n${len(key)}\r\n{key}\r\n*{len(entries)}\r\n".encode()
@@ -520,8 +456,8 @@ async def handle_xread(args, reader=None, writer=None):
                 s += f"${len(eid)}\r\n{eid}\r\n".encode()
                 s += f"*{len(fv)*2}\r\n".encode()
                 for p in fv:
-                    s += resp_encode_bulk(p[0])
-                    s += resp_encode_bulk(p[1])
+                    s += resp_bulk(p[0])
+                    s += resp_bulk(p[1])
         return s
 
 # ------------------------
@@ -529,263 +465,234 @@ async def handle_xread(args, reader=None, writer=None):
 # ------------------------
 
 def subscribe_writer_to_channels(writer, channels):
-    wid = writer
-    if wid not in subscriptions:
-        subscriptions[wid] = set()
+    if writer not in subscriptions:
+        subscriptions[writer] = set()
     for ch in channels:
-        subscriptions[wid].add(ch)
-        channel_subs[ch].add(wid)
+        subscriptions[writer].add(ch)
+        channel_subs[ch].add(writer)
+    subscriber_mode.add(writer)
 
 def unsubscribe_writer_from_channels(writer, channels):
-    wid = writer
-    if wid not in subscriptions:
-        subscriptions[wid] = set()
+    if writer not in subscriptions:
+        subscriptions[writer] = set()
     for ch in channels:
-        if ch in subscriptions[wid]:
-            subscriptions[wid].remove(ch)
-        if wid in channel_subs.get(ch, set()):
-            channel_subs[ch].remove(wid)
+        if ch in subscriptions[writer]:
+            subscriptions[writer].remove(ch)
+        if writer in channel_subs.get(ch, set()):
+            channel_subs[ch].remove(writer)
             if not channel_subs[ch]:
                 del channel_subs[ch]
-    if not subscriptions[wid]:
-        # leave subscriber mode
-        if wid in subscriptions:
-            del subscriptions[wid]
+    if not subscriptions.get(writer):
+        subscriptions.pop(writer, None)
+        subscriber_mode.discard(writer)
 
-async def handle_subscribe(args, reader=None, writer=None):
-    # args are bytes channels
-    channels = [a.decode() for a in args] if args else []
-    if not channels:
-        channels = [""]
-    wid = writer
-    if wid not in subscriptions:
-        subscriptions[wid] = set()
-    subscriber_mode.add(wid)
-    out_bytes = b""
-    for ch in channels:
-        if ch not in subscriptions[wid]:
-            subscriptions[wid].add(ch)
-            channel_subs[ch].add(wid)
-        cnt = len(subscriptions[wid])
-        out_bytes += resp_subscribe_reply("subscribe", ch, cnt)
-    # writer remains in subscribed mode
-    return out_bytes
-
-async def handle_unsubscribe(args, reader=None, writer=None):
-    channels = [a.decode() for a in args] if args else []
-    wid = writer
-    if wid not in subscriptions:
-        subscriptions[wid] = set()
+async def handle_subscribe(argv, reader=None, writer=None):
+    channels = [a.decode() for a in argv[1:]] if len(argv) > 1 else [""]
     out = b""
-    if not channels:
-        # unsubscribe from all
-        channels = list(subscriptions.get(wid, [])) or [""]
+    if writer not in subscriptions:
+        subscriptions[writer] = set()
+    subscriber_mode.add(writer)
     for ch in channels:
-        if ch in subscriptions.get(wid, set()):
-            subscriptions[wid].remove(ch)
-        if wid in channel_subs.get(ch, set()):
-            channel_subs[ch].remove(wid)
-            if not channel_subs[ch]:
-                del channel_subs[ch]
-        cnt = len(subscriptions.get(wid, set()))
-        out += resp_subscribe_reply("unsubscribe", ch, cnt)
-    # if no channels remain, leave subscribed mode for this writer
-    if len(subscriptions.get(wid, set())) == 0:
-        subscriber_mode.discard(wid)
-        if wid in subscriptions:
-            del subscriptions[wid]
+        if ch not in subscriptions[writer]:
+            subscriptions[writer].add(ch)
+            channel_subs[ch].add(writer)
+        out += resp_subscribe_reply("subscribe", ch, len(subscriptions[writer]))
     return out
 
-async def handle_publish(args, reader=None, writer=None):
-    ch = args[0].decode()
-    msg = args[1].decode()
-    receivers = channel_subs.get(ch, set())
+async def handle_unsubscribe(argv, reader=None, writer=None):
+    channels = [a.decode() for a in argv[1:]] if len(argv) > 1 else []
+    out = b""
+    if writer not in subscriptions:
+        subscriptions[writer] = set()
+    if not channels:
+        channels = list(subscriptions.get(writer, [])) or [""]
+    for ch in channels:
+        if ch in subscriptions.get(writer, set()):
+            subscriptions[writer].remove(ch)
+        if writer in channel_subs.get(ch, set()):
+            channel_subs[ch].remove(writer)
+            if not channel_subs[ch]:
+                del channel_subs[ch]
+        out += resp_subscribe_reply("unsubscribe", ch, len(subscriptions.get(writer, set())))
+    if len(subscriptions.get(writer, set())) == 0:
+        subscriptions.pop(writer, None)
+        subscriber_mode.discard(writer)
+    return out
+
+async def handle_publish(argv, reader=None, writer=None):
+    ch = argv[1].decode()
+    msg = argv[2].decode()
+    receivers = list(channel_subs.get(ch, set()))
     count = 0
-    for w in list(receivers):
+    for w in receivers:
         try:
-            # build message: ["message", channel, message] -> *3\r\n$7\r\nmessage\r\n$<len>\r\nch\r\n$<len>\r\nmsg\r\n
             data = (f"*3\r\n$7\r\nmessage\r\n${len(ch)}\r\n{ch}\r\n${len(msg)}\r\n{msg}\r\n").encode()
             w.write(data)
             await w.drain()
             count += 1
         except Exception:
             pass
-    # reply to publisher with integer count
-    return resp_encode_int(count)
+    return resp_int(count)
 
 # ------------------------
-# INFO / CONFIG / KEYS
+# INFO/CONFIG/KEYS
 # ------------------------
 
-async def handle_info(args, reader=None, writer=None, config_role='master'):
-    section = args[0].decode() if args else "all"
-    if section == "replication":
-        role = config_role
-        # minimal fields
-        s = f"role:{role}\nmaster_replid:000000\nmaster_repl_offset:0\n"
-        return resp_encode_bulk(s)
-    return resp_encode_bulk("ok")
+async def handle_info(argv, reader=None, writer=None, role='master'):
+    s = f"role:{role}\nmaster_replid:000000\nmaster_repl_offset:0\n"
+    return resp_bulk(s)
 
-async def handle_config_get(args, reader=None, writer=None, config_dir="", config_dbfilename="dump.rdb"):
-    param = args[1].decode()
+async def handle_config_get(argv, reader=None, writer=None, config_dir="", dbfilename="dump.rdb"):
+    param = argv[2].decode() if len(argv) > 2 else ""
     if param == "dir":
-        return resp_encode_array_from_bytes_elements([resp_encode_bulk("dir"), resp_encode_bulk(config_dir)])
+        return resp_array_from_encoded([resp_bulk("dir"), resp_bulk(config_dir)])
     if param == "dbfilename":
-        return resp_encode_array_from_bytes_elements([resp_encode_bulk("dbfilename"), resp_encode_bulk(config_dbfilename)])
-    return resp_encode_array_from_bytes_elements([])
+        return resp_array_from_encoded([resp_bulk("dbfilename"), resp_bulk(dbfilename)])
+    return resp_array_from_encoded([])
 
-async def handle_keys(args, reader=None, writer=None):
-    pattern = args[0].decode()
+async def handle_keys(argv, reader=None, writer=None):
+    pattern = argv[1].decode() if len(argv) > 1 else "*"
     if pattern == "*":
         ks = list(kv.keys())
     else:
         import re
         regex = pattern.replace("*", ".*")
         ks = [k for k in kv.keys() if re.match(regex, k)]
-    arr = b"*%d\r\n" % len(ks)
+    out = f"*{len(ks)}\r\n".encode()
     for k in ks:
-        arr += resp_encode_bulk(k)
-    return arr
+        out += resp_bulk(k)
+    return out
 
 # ------------------------
-# Execute command router
+# Command dispatcher with MULTI/EXEC handling
 # ------------------------
 
-async def execute_command(argv, reader, writer, config=None):
+async def dispatch(argv, reader, writer):
     """
-    argv: list of bulk items where each item may be bytes or list if nested arrays.
-    For our use, argv will be list of bytes/bulk values for a command.
+    argv: list where argv[0] is command (bytes or str), following are bulk args (bytes or None).
+    Return RESP bytes or None if blocked.
     """
-    # Normalize argv elements to bytes (bulk strings) or None
-    args = []
-    for a in argv[1:]:
-        if isinstance(a, bytes):
-            args.append(a)
-        elif isinstance(a, str):
-            args.append(a.encode())
-        elif a is None:
-            args.append(None)
-        else:
-            # If nested array etc, convert item to bytes representation
-            args.append(str(a).encode())
-    cmd = argv[0]
-    # if bulk bytes, decode command name
-    if isinstance(cmd, bytes):
-        cmd_name = cmd.decode().lower()
-    else:
-        cmd_name = str(cmd).lower()
+    # Normalize cmd name
+    cmd_raw = argv[0]
+    cmd_name = cmd_raw.decode().lower() if isinstance(cmd_raw, bytes) else str(cmd_raw).lower()
 
-    # Check if writer in subscribed mode: allow only SUBSCRIBE/UNSUBSCRIBE/PING/QUIT
+    # If subscriber mode: only SUBSCRIBE, UNSUBSCRIBE, PING are allowed
     if writer in subscriber_mode:
         if cmd_name == "subscribe":
-            return await handle_subscribe(args, reader, writer)
-        elif cmd_name == "unsubscribe":
-            return await handle_unsubscribe(args, reader, writer)
-        elif cmd_name == "ping":
-            return await handle_ping(args, reader, writer)
-        else:
-            # Can't execute other commands when subscribed
-            return resp_encode_error(f"ERR Can't execute '{cmd_name.upper()}' in this context")
+            return await handle_subscribe(argv, reader, writer)
+        if cmd_name == "unsubscribe":
+            return await handle_unsubscribe(argv, reader, writer)
+        if cmd_name == "ping":
+            return await handle_ping(argv, reader, writer)
+        # other commands not allowed
+        return resp_error(f"ERR Can't execute '{cmd_name.upper()}' in this context")
 
     # Transaction queuing logic
     wid = writer
     if wid in multi_clients and cmd_name not in ("multi", "exec", "discard"):
-        # queue the decoded argv (as list of bytes) into multi_deques[wid]
-        multi_deques[writer_id(wid)].append([ (x if isinstance(x, bytes) else (x.encode() if isinstance(x, str) else str(x).encode())) for x in argv ])
-        return resp_encode_simple_str("QUEUED")
+        # queue the command bytes (ensure each arg is bytes)
+        queued = []
+        for a in argv:
+            if isinstance(a, bytes):
+                queued.append(a)
+            elif a is None:
+                queued.append(None)
+            else:
+                queued.append(str(a).encode())
+        multi_deques[writer_id(writer)].append(queued)
+        return resp_simple("QUEUED")
 
-    # Normal dispatch
+    # Dispatch
     try:
         if cmd_name == "ping":
-            return await handle_ping(args, reader, writer)
-        elif cmd_name == "echo":
-            return await handle_echo(args, reader, writer)
-        elif cmd_name == "set":
-            return await handle_set(args, reader, writer)
-        elif cmd_name == "get":
-            return await handle_get(args, reader, writer)
-        elif cmd_name == "incr":
-            return await handle_incr(args, reader, writer)
-        elif cmd_name == "rpush":
-            return await handle_rpush(args, reader, writer)
-        elif cmd_name == "lpush":
-            return await handle_lpush(args, reader, writer)
-        elif cmd_name == "llen":
-            return await handle_llen(args, reader, writer)
-        elif cmd_name == "lrange":
-            return await handle_lrange(args, reader, writer)
-        elif cmd_name == "lpop":
-            return await handle_lpop(args, reader, writer)
-        elif cmd_name == "blpop":
-            return await handle_blpop(args, reader, writer)
-        elif cmd_name == "xadd":
-            return await handle_xadd(args, reader, writer)
-        elif cmd_name == "xrange":
-            return await handle_xrange(args, reader, writer)
-        elif cmd_name == "xread":
-            return await handle_xread(args, reader, writer)
-        elif cmd_name == "multi":
-            # start transaction for this writer
+            return await handle_ping(argv, reader, writer)
+        if cmd_name == "echo":
+            return await handle_echo(argv, reader, writer)
+        if cmd_name == "set":
+            return await handle_set(argv, reader, writer)
+        if cmd_name == "get":
+            return await handle_get(argv, reader, writer)
+        if cmd_name == "incr":
+            return await handle_incr(argv, reader, writer)
+        if cmd_name == "rpush":
+            return await handle_rpush(argv, reader, writer)
+        if cmd_name == "lpush":
+            return await handle_lpush(argv, reader, writer)
+        if cmd_name == "llen":
+            return await handle_llen(argv, reader, writer)
+        if cmd_name == "lrange":
+            return await handle_lrange(argv, reader, writer)
+        if cmd_name == "lpop":
+            return await handle_lpop(argv, reader, writer)
+        if cmd_name == "blpop":
+            return await handle_blpop(argv, reader, writer)
+        if cmd_name == "xadd":
+            return await handle_xadd(argv, reader, writer)
+        if cmd_name == "xrange":
+            return await handle_xrange(argv, reader, writer)
+        if cmd_name == "xread":
+            return await handle_xread(argv, reader, writer)
+        if cmd_name == "multi":
             multi_clients.add(writer)
             multi_deques[writer_id(writer)] = deque()
-            return resp_encode_simple_str("OK")
-        elif cmd_name == "discard":
+            return resp_simple("OK")
+        if cmd_name == "discard":
             if writer in multi_clients:
                 multi_clients.discard(writer)
                 multi_deques[writer_id(writer)].clear()
-                return resp_encode_simple_str("OK")
-            return resp_encode_error("ERR DISCARD without MULTI")
-        elif cmd_name == "exec":
+                return resp_simple("OK")
+            return resp_error("ERR DISCARD without MULTI")
+        if cmd_name == "exec":
             if writer not in multi_clients:
-                return resp_encode_error("ERR EXEC without MULTI")
+                return resp_error("ERR EXEC without MULTI")
+            # pop multi mode and get queued cmds
             multi_clients.discard(writer)
             queued = list(multi_deques[writer_id(writer)])
             multi_deques[writer_id(writer)].clear()
             if not queued:
                 return b"*0\r\n"
-            # execute queued commands sequentially; collect results as RESP-encoded bytes
             results = []
+            # Execute each queued command sequentially; each queued element is a list of bytes args
             for q in queued:
-                # q is list of bytes
-                # run same execute_command but in "executing" mode: queued commands must not be re-queued
-                # decode q into similar argv structure
-                # pass reader/writer and ensure we treat nested as bytes
-                res = await execute_command(q, reader, writer)
-                # res is RESP bytes; append as element into array
-                results.append(res)
-            # Build RESP array from raw RESP-encoded elements
+                # Note: while executing queued commands, we should not re-queue them — we already removed writer from multi_clients.
+                res = await dispatch(q, reader, writer)
+                # If handler returned None (blocked), then spec says EXEC should return error? For this simplified implementation, we'll put error.
+                if res is None:
+                    # return EXECABORT error element for that command
+                    results.append(resp_error("EXECABORT Transaction discarded because of previous errors."))
+                else:
+                    results.append(res)
+            # Build RESP array where each element is already a full RESP-encoded reply
             merged = f"*{len(results)}\r\n".encode()
             for r in results:
                 merged += r
             return merged
-        elif cmd_name == "subscribe":
-            return await handle_subscribe(args, reader, writer)
-        elif cmd_name == "unsubscribe":
-            return await handle_unsubscribe(args, reader, writer)
-        elif cmd_name == "publish":
-            return await handle_publish(args, reader, writer)
-        elif cmd_name == "info":
-            role = "master"
-            return await handle_info(args, reader, writer, config_role=role)
-        elif cmd_name == "config":
+        if cmd_name == "subscribe":
+            return await handle_subscribe(argv, reader, writer)
+        if cmd_name == "unsubscribe":
+            return await handle_unsubscribe(argv, reader, writer)
+        if cmd_name == "publish":
+            return await handle_publish(argv, reader, writer)
+        if cmd_name == "info":
+            return await handle_info(argv, reader, writer, role='master')
+        if cmd_name == "config":
             # expect CONFIG GET <param>
-            if len(args) >= 2 and args[0].decode().lower() == "get":
-                return await handle_config_get(args, reader, writer, config_dir="", config_dbfilename="dump.rdb")
-            return resp_encode_error("ERR")
-        elif cmd_name == "keys":
-            return await handle_keys(args, reader, writer)
-        else:
-            return resp_encode_error(f"ERR unknown command '{cmd_name.upper()}'")
+            if len(argv) >= 3 and (isinstance(argv[1], bytes) and argv[1].decode().lower() == 'get'):
+                return await handle_config_get(argv, reader, writer, config_dir="", dbfilename="dump.rdb")
+            return resp_error("ERR")
+        if cmd_name == "keys":
+            return await handle_keys(argv, reader, writer)
+        return resp_error(f"ERR unknown command '{cmd_name.upper()}'")
     except Exception as e:
-        return resp_encode_error("EXECABORT Transaction discarded because of previous errors.") if cmd_name == 'exec' else resp_encode_error(str(e))
+        # For queued/exec errors we respond with EXECABORT message similar to your earlier tests
+        return resp_error("EXECABORT Transaction discarded because of previous errors.") if cmd_name == 'exec' else resp_error(str(e))
 
 # ------------------------
-# RESP reader loop (per client)
+# Per-connection read loop
 # ------------------------
 
 async def handle_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     peer = writer.get_extra_info("peername")
-    # read loop: accumulate bytes and parse as many messages as possible
     buffer = b""
     try:
         while True:
@@ -793,55 +700,37 @@ async def handle_connection(reader: asyncio.StreamReader, writer: asyncio.Stream
             if not data:
                 break
             buffer += data
-            # parse all complete messages
-            msgs = parse_all(buffer)
-            # compute how much of buffer was consumed: parse_all consumes as much as possible, but we must recompute
-            # We'll reparse to consume correctly using parse_next until incomplete
-            consumed = 0
-            to_process = []
-            tmp = buffer
-            while tmp:
-                try:
-                    item, tmp = parse_next(tmp)
-                    # for our purposes we want arrays where first element is bulk string command
-                    to_process.append(item)
-                    consumed = len(buffer) - len(tmp)
-                except RuntimeError:
-                    break
-            # trim buffer
+            msgs, consumed = parse_all(buffer)
+            # consume that many bytes
             buffer = buffer[consumed:]
-            # process messages
-            for item in to_process:
-                # Only arrays are valid commands (client sends arrays)
+            # msgs is list of parsed RESP items (top-level arrays etc)
+            for item in msgs:
+                # Only process array commands
                 if not isinstance(item, list):
-                    # ignore invalid
                     continue
-                # execute
-                res = await execute_command(item, reader, writer)
+                # Ensure command args are in expected form: bulk strings (bytes/None)
+                # item is list of bytes/None or nested items
+                res = await dispatch(item, reader, writer)
                 if res is None:
-                    # blocked command (like BLPOP or XREAD BLOCK) -> do not write anything now
+                    # blocked operation: don't send any immediate response
                     continue
                 try:
                     writer.write(res)
                     await writer.drain()
                 except Exception:
                     pass
-    except asyncio.CancelledError:
-        pass
     except Exception:
         pass
     finally:
-        # cleanup on disconnect: remove subscriptions and multi state
-        wid = writer
-        if wid in subscriptions:
-            # remove writer from channel_subs
-            for ch in list(subscriptions[wid]):
-                if wid in channel_subs.get(ch, set()):
-                    channel_subs[ch].remove(wid)
-                if not channel_subs.get(ch):
-                    channel_subs.pop(ch, None)
-            subscriptions.pop(wid, None)
-        subscriber_mode.discard(wid)
+        # cleanup on disconnect: remove from subscriptions and multi state
+        if writer in subscriptions:
+            for ch in list(subscriptions[writer]):
+                if writer in channel_subs.get(ch, set()):
+                    channel_subs[ch].remove(writer)
+                    if not channel_subs[ch]:
+                        channel_subs.pop(ch, None)
+            subscriptions.pop(writer, None)
+        subscriber_mode.discard(writer)
         if writer in multi_clients:
             multi_clients.discard(writer)
             multi_deques.pop(writer_id(writer), None)
