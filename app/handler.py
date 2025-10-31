@@ -102,12 +102,17 @@ def cmd_executor(decoded_data, connection, config, executing=False):
                 res, _ = cmd_executor(queued, connection, config, executing=True)
             except Exception:
                 res = error_encoder("EXEC command failed")
-            # Substitute None with +OK (Redis does this for SET, etc.)
-            if res is None or res == b"$-1\r\n":
-                res = simple_string_encoder("OK")
+
+            # If command returned nothing, assume it was a SET (default OK)
+            if res is None:
+                if queued[0].upper() == "SET":
+                    res = simple_string_encoder("OK")
+                else:
+                    # safer fallback: nil bulk string
+                    res = b"$-1\r\n"
+
             results.append(res)
 
-        # Build one full RESP array response
         merged = f"*{len(results)}\r\n".encode()
         for r in results:
             if isinstance(r, bytes):
