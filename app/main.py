@@ -875,10 +875,18 @@ def queue_transaction(command: List, conn: socket.socket):
 
 def handle_transaction(args: Args, conn: socket.socket, is_replica_conn: bool):
     global transactions
-    response = []
-    for transaction in transactions[conn]:
-        response.append(handle_command(args, transaction, conn, is_replica_conn))
-    return response
+    results = []
+    for command in transactions[conn]:
+        resp = handle_command(args, command, conn, is_replica_conn)
+        if resp is None:
+            # Return Null bulk for missing key or nil response
+            results.append(None)
+        elif isinstance(resp, (bytes, str, int, list)):
+            results.append(resp)
+        else:
+            # Fallback if something unexpected slips through
+            results.append(f"-ERR Invalid transaction response type {type(resp)}")
+    return results
 
 
 def main(args: Args):
