@@ -298,15 +298,18 @@ def handle_command(
                 if db_value is None:
                     response = None
                 elif db_value.expiry is not None and now >= db_value.expiry:
-                    # Expired, remove and return null bulk string
                     db.pop(k, None)
                     response = None
                 else:
                     val = db_value.value
+                    # Normalize both bytes and str to UTF-8 decoded
                     if isinstance(val, bytes):
-                        response = val
+                        try:
+                            response = val.decode()
+                        except UnicodeDecodeError:
+                            response = val  # fallback raw bytes
                     else:
-                        response = str(val).encode()
+                        response = str(val)
         case [b"INFO", b"replication"]:
             if args.replicaof is None:
                 response = f"""\
