@@ -301,9 +301,7 @@ def handle_client(connection, config, data=b""):
                     if decoded_data[0] == 82 or decoded_data[0] == 'F':
                         continue
 
-                    _, queued = cmd_executor(
-                        decoded_data, connection, config, queued, executing
-                    )
+                    _, queued = cmd_executor(decoded_data, connection, executing)
 
                     prev_cmd = decoded_data[0]
 
