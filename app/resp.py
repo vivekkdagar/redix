@@ -152,3 +152,11 @@ def read_key_val_from_db(dir, dbfilename, data):
                 data[currKey] = (val, -1)
 
         return
+
+def bulk_string_encoder(value):
+    if value is None:
+        return b"$-1\r\n"
+    return f"${len(value)}\r\n{value}\r\n".encode()
+
+def integer_encoder(num):
+    return f":{num}\r\n".encode()
