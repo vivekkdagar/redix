@@ -1,21 +1,18 @@
-from ast import arguments
 import socket
 import sys
 import os
 import threading
 import time
 import math
-import argparse
-from xmlrpc import client
-from .parser import parsed_resp_array
-from .data_store import BLOCKING_CLIENTS, BLOCKING_CLIENTS_LOCK, BLOCKING_STREAMS, BLOCKING_STREAMS_LOCK, \
+from app.parser import parsed_resp_array
+from app1.data_store import BLOCKING_CLIENTS, BLOCKING_CLIENTS_LOCK, BLOCKING_STREAMS, BLOCKING_STREAMS_LOCK, \
     CHANNEL_SUBSCRIBERS, DATA_LOCK, DATA_STORE, SORTED_SETS, STREAMS, WAIT_CONDITION, WAIT_LOCK, \
     _serialize_command_to_resp_array, add_to_sorted_set, cleanup_blocked_client, enqueue_client_command, \
     get_client_queued_commands, get_sorted_set_range, get_sorted_set_rank, get_stream_max_id, get_zscore, \
     increment_key_value, is_client_in_multi, is_client_subscribed, load_rdb_to_datastore, lrange_rtn, \
     num_client_subscriptions, prepend_to_list, remove_elements_from_list, remove_from_sorted_set, set_client_in_multi, \
     size_of_list, append_to_list, existing_list, get_data_entry, set_list, set_string, subscribe, unsubscribe, xadd, \
-    xrange, xread, REPLICA_ACK_OFFSETS
+    xrange, xread
 
 # --------------------------------------------------------------------------------
 
@@ -159,7 +156,7 @@ def decode_geohash_to_coords(geo_code: int) -> tuple[float, float]:
 
 
 # Default Redis config
-DIR = "."
+DIR = "../../app1"
 DB_FILENAME = "dump.rdb"
 
 SERVER_ROLE = "master"  # Default role is master
@@ -251,7 +248,7 @@ def _xread_serialize_response(stream_data: dict[str, list[dict]]) -> bytes:
     return b"*" + str(len(outer_response_parts)).encode() + b"\r\n" + b"".join(outer_response_parts)
 
 
-def execute_single_command(command: str, arguments: list, client: socket.socket) -> bytes | bool:
+def execute_single_command(command: str, arguments: list, client: socket.socket):
     response = None
     """
     Executes a single command and sends the response.

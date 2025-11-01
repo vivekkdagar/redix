@@ -6,9 +6,10 @@ import threading
 DATA_LOCK = threading.Lock()
 
 BLOCKING_CLIENTS_LOCK = threading.Lock()
+BLOCKING_STREAMS_LOCK = threading.Lock()
+
 BLOCKING_CLIENTS = {}
 BLOCKING_STREAMS = {}
-BLOCKING_STREAMS_LOCK = threading.Lock()
 
 CHANNEL_SUBSCRIBERS = {}
 CLIENT_SUBSCRIPTIONS = {}
