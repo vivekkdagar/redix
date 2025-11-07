@@ -1,3 +1,29 @@
+"""
+Redis Command Execution Module
+
+This module handles the execution of all Redis commands supported by the server.
+It processes commands received from clients and returns appropriate RESP-formatted responses.
+
+Supported Command Categories:
+    - Basic Commands: PING, ECHO, SET, GET, TYPE, CONFIG, KEYS
+    - Lists: LPUSH, RPUSH, LPOP, LRANGE, LLEN, BLPOP
+    - Streams: XADD, XRANGE, XREAD (with blocking support)
+    - Sorted Sets: ZADD, ZRANK, ZRANGE, ZCARD, ZSCORE, ZREM
+    - Transactions: MULTI, EXEC, DISCARD, INCR
+    - Pub/Sub: SUBSCRIBE, UNSUBSCRIBE, PUBLISH
+    - Replication: REPLCONF, PSYNC, INFO, WAIT
+    - Geospatial: GEOADD, GEOPOS, GEODIST, GEOSEARCH
+
+Architecture:
+    The module uses a centralized command execution approach where each command
+    is handled by dedicated logic within execute_single_command(). Commands are
+    parsed using RESP protocol and responses are formatted according to Redis specs.
+
+Thread Safety:
+    All data operations use locks from the data_store module to ensure thread-safe
+    concurrent access. Blocking operations use condition variables for coordination.
+"""
+
 import socket
 import sys
 import os
@@ -14,10 +40,14 @@ from app1.data_store import BLOCKING_CLIENTS, BLOCKING_CLIENTS_LOCK, BLOCKING_ST
     size_of_list, append_to_list, existing_list, get_data_entry, set_list, set_string, subscribe, unsubscribe, xadd, \
     xrange, xread
 
-# --------------------------------------------------------------------------------
+# ============================================================================
+# CONFIGURATION AND CONSTANTS
+# ============================================================================
 
+# Commands that modify data and should be propagated to replicas
 WRITE_COMMANDS = {"SET", "LPUSH", "RPUSH", "LPOP", "ZADD", "ZREM", "XADD", "INCR", "GEOADD"}
 
+# Geospatial constants for coordinate validation and calculations
 MIN_LON = -180.0
 MAX_LON = 180.0
 MIN_LAT = -85.05112878
@@ -26,13 +56,29 @@ MAX_LAT = 85.05112878
 LATITUDE_RANGE = MAX_LAT - MIN_LAT
 LONGITUDE_RANGE = MAX_LON - MIN_LON
 
-EARTH_RADIUS_M = 6372797.560856
+EARTH_RADIUS_M = 6372797.560856  # Earth radius in meters for Haversine formula
 
 
-# ... (MIN_LON, MAX_LON, MIN_LAT, MAX_LAT and coordinate helper functions remain the same)
+# ============================================================================
+# GEOSPATIAL HELPER FUNCTIONS
+# ============================================================================
+# These functions support geospatial commands (GEOADD, GEOPOS, GEODIST, GEOSEARCH)
+# by providing coordinate conversion, distance calculation, and geohash encoding/decoding.
 
 def convert_to_meters(radius: float, unit: str) -> float:
-    """Converts a radius value from a given unit to meters."""
+    """
+    Converts a radius value from a given unit to meters.
+    
+    Args:
+        radius: The radius value to convert
+        unit: The unit of measurement ('m', 'km', 'mi', 'ft')
+    
+    Returns:
+        The radius value in meters
+    
+    Raises:
+        ValueError: If the unit is not recognized
+    """
     unit = unit.lower()
     if unit == 'm':
         return radius
@@ -248,10 +294,40 @@ def _xread_serialize_response(stream_data: dict[str, list[dict]]) -> bytes:
     return b"*" + str(len(outer_response_parts)).encode() + b"\r\n" + b"".join(outer_response_parts)
 
 
+# ============================================================================
+# COMMAND EXECUTION
+# ============================================================================
+# This section contains the main command execution logic for all supported Redis commands.
+# Commands are organized by category for easier navigation and maintenance.
+
 def execute_single_command(command: str, arguments: list, client: socket.socket):
+    """
+    Executes a single Redis command and returns the appropriate response.
+    
+    This is the main command dispatcher that routes commands to their respective handlers.
+    Each command category (basic, lists, streams, etc.) has dedicated logic within this function.
+    
+    Args:
+        command: The Redis command to execute (e.g., 'SET', 'GET', 'LPUSH')
+        arguments: List of arguments for the command
+        client: The client socket connection (used for pub/sub and transactions)
+    
+    Returns:
+        bytes: RESP-formatted response to send back to the client
+        bool: True for special commands that don't return a response (like REPLCONF ACK)
+    
+    Command Categories:
+        - Basic: PING, ECHO, SET, GET, TYPE, CONFIG, KEYS
+        - Lists: LPUSH, RPUSH, LPOP, LRANGE, LLEN, BLPOP
+        - Streams: XADD, XRANGE, XREAD
+        - Sorted Sets: ZADD, ZRANK, ZRANGE, ZCARD, ZSCORE, ZREM
+        - Transactions: MULTI, EXEC, DISCARD, INCR
+        - Pub/Sub: SUBSCRIBE, UNSUBSCRIBE, PUBLISH
+        - Replication: REPLCONF, PSYNC, INFO, WAIT
+        - Geospatial: GEOADD, GEOPOS, GEODIST, GEOSEARCH
+    """
     response = None
     """
-    Executes a single command and sends the response.
     Returns True if the command was processed successfully, False otherwise (e.g., unknown command).
     """
     if is_client_subscribed(client):
