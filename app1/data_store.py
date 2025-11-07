@@ -1,36 +1,97 @@
+"""
+Redis Data Store Module
+
+This module provides the complete data storage implementation for the Redis server,
+supporting multiple data types and advanced features.
+
+Data Structures:
+    - DATA_STORE: Main key-value storage with support for strings, lists, streams, sorted sets
+    - STREAMS: Stream data structure for append-only log functionality
+    - SORTED_SETS: Sorted set data structure with score-based ordering
+    - CHANNEL_SUBSCRIBERS: Pub/Sub channel subscription mapping
+    - CLIENT_SUBSCRIPTIONS: Track client subscriptions
+    - CLIENT_STATE: Transaction state per client
+    - BLOCKING_CLIENTS: Clients waiting on blocking operations
+    - BLOCKING_STREAMS: Clients waiting on stream blocking reads
+    - REPLICA_ACK_OFFSETS: Replication offset tracking for replicas
+
+Thread Safety:
+    All data structures are protected by appropriate locks:
+    - DATA_LOCK: Protects main data store operations
+    - BLOCKING_CLIENTS_LOCK: Protects blocking operations queue
+    - BLOCKING_STREAMS_LOCK: Protects stream blocking operations
+    - WAIT_LOCK: Protects replication WAIT operations
+
+Features:
+    - String values with optional expiration (millisecond precision)
+    - Lists with prepend, append, and range operations
+    - Streams with auto-generated IDs and blocking reads
+    - Sorted sets with score-based ranking
+    - Transactions with MULTI/EXEC/DISCARD
+    - Pub/Sub messaging between clients
+    - RDB file loading for persistence
+    - Lazy deletion of expired keys
+"""
+
 import time
 import threading
+
+# ============================================================================
+# THREAD SAFETY - LOCKS
+# ============================================================================
 
 # The Lock ensures that only one thread can modify the store at a time,
 # preventing data corruption (race conditions) when multiple clients run SET simultaneously.
 DATA_LOCK = threading.Lock()
 
+# Locks for blocking operations
 BLOCKING_CLIENTS_LOCK = threading.Lock()
 BLOCKING_STREAMS_LOCK = threading.Lock()
 
+# ============================================================================
+# DATA STRUCTURES
+# ============================================================================
+
+# Blocking operations - clients waiting for list/stream data
 BLOCKING_CLIENTS = {}
 BLOCKING_STREAMS = {}
 
-CHANNEL_SUBSCRIBERS = {}
-CLIENT_SUBSCRIPTIONS = {}
-CLIENT_STATE = {}
+# Pub/Sub data structures
+CHANNEL_SUBSCRIBERS = {}  # Maps channel name to set of subscriber sockets
+CLIENT_SUBSCRIPTIONS = {}  # Maps client socket to set of subscribed channels
+CLIENT_STATE = {}  # Tracks transaction state per client
 
+# Sorted sets storage
 SORTED_SETS = {}
 
+# Streams storage
 STREAMS = {}
 
+# Transaction flag (deprecated - use CLIENT_STATE instead)
 multi_flag = False
 
-# New state for WAIT command on master
+# ============================================================================
+# REPLICATION STATE
+# ============================================================================
+
+# State for WAIT command on master
 WAIT_LOCK = threading.Lock()
 WAIT_CONDITION = threading.Condition(WAIT_LOCK)
 # Maps replica socket to its last acknowledged offset (int)
 REPLICA_ACK_OFFSETS = {}
 
+# ============================================================================
+# MAIN DATA STORE
+# ============================================================================
+
 # The central storage. Keys map to a dictionary containing value, type, and expiry metadata.
 # Example: {'mykey': {'type': 'string', 'value': 'myvalue', 'expiry': 1731671220000}}
 DATA_STORE = {}
 
+
+# ============================================================================
+# BASIC KEY-VALUE OPERATIONS
+# ============================================================================
 
 def get_data_entry(key: str) -> dict | None:
     """
