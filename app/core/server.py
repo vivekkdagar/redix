@@ -3,8 +3,8 @@ import threading
 import sys
 
 from app.protocol.constants import *
-from command_execution import handle_connection
-import command_execution as ce
+from app.core.command_execution import handle_connection
+import app.core.command_execution as ce
 
 
 
