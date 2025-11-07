@@ -92,6 +92,7 @@ class RedisServer:
         """Start the Redis server and listen for connections."""
         try:
             # Create server socket
+            # Note: reuse_port=True allows quick server restarts during development/testing
             self.server_socket = socket.create_server(
                 (self.host, self.port),
                 reuse_port=True
