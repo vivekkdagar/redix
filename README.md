@@ -88,7 +88,15 @@ app/
 │   ├── server.py                # TCP server and replication logic
 │   ├── command_execution.py     # All command handlers
 │   ├── context.py               # Server context and global state
-│   └── datastore.py             # Data storage interface
+│   └── datastore.py             # Complete data store implementation
+│       ├── String storage with expiration
+│       ├── List operations
+│       ├── Stream operations
+│       ├── Sorted set operations
+│       ├── Transaction support
+│       ├── Pub/Sub support
+│       ├── RDB file loading
+│       └── Blocking operations
 ├── protocol/
 │   ├── resp.py                  # RESP protocol parser (new modular)
 │   └── constants.py             # Protocol constants
@@ -98,17 +106,6 @@ app/
 │   └── utils.py                 # Replication utilities
 ├── config.py                    # Server configuration
 └── parser.py                    # Command parser
-
-app1/
-└── data_store.py                # Complete data store implementation
-    ├── String storage with expiration
-    ├── List operations
-    ├── Stream operations
-    ├── Sorted set operations
-    ├── Transaction support
-    ├── Pub/Sub support
-    ├── RDB file loading
-    └── Blocking operations
 ```
 
 ## Installation
@@ -248,7 +245,7 @@ Redix implements the full Redis Serialization Protocol (RESP):
 
 ### Data Store
 
-The comprehensive data store (`app1/data_store.py`) provides:
+The comprehensive data store (`app/core/datastore.py`) provides:
 - Thread-safe operations using locks
 - Multiple data type support (strings, lists, streams, sorted sets)
 - Expiration timestamp tracking
